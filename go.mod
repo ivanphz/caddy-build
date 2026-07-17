@@ -14,7 +14,7 @@ require (
 	github.com/imgk/caddy-trojan v0.2.11-3
 	github.com/lanrat/caddy-dynamic-remoteip v0.0.0-20231007025615-f72ed4fc7b9c
 	github.com/mholt/caddy-events-exec v0.1.0
-	github.com/mholt/caddy-l4 v0.1.1
+	github.com/mholt/caddy-l4 v0.1.2
 	github.com/mholt/caddy-ratelimit v0.1.0
 	github.com/mholt/caddy-webdav v0.0.0-20260127042217-fa2f366b0d75
 	github.com/monobilisim/caddy-ip-list v0.0.0-20250818180736-cd5c45325ade
@@ -110,7 +110,7 @@ require (
 	github.com/nicksnyder/go-i18n/v2 v2.6.1 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
-	github.com/pires/go-proxyproto v0.12.0 // indirect
+	github.com/pires/go-proxyproto v0.13.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
