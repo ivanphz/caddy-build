@@ -1,0 +1,112 @@
+name: Sync dist assets
+
+# 从 caddyserver/dist 同步打包资产（默认 Caddyfile 和欢迎页）。
+#
+# 为什么在 CI 同步而不是让 install.sh 直接从上游拉：
+#   1. dist/Caddyfile 的落点是 /etc/caddy/Caddyfile。走 CI 的话，上游任何变动
+#      都先变成一个可审查的 commit diff，而不是直接落到新装的机器上。
+#   2. 安装路径只依赖本仓库一个来源，一个 GH_MIRROR 就能覆盖全部。
+#   3. 仓库任一 commit 都是自洽快照，回装旧版本不会配到一份新的上游文件。
+#
+# 用 GITHUB_TOKEN 就够 —— dist/ 不参与编译，这里的提交不需要触发任何下游工作流，
+# 所以没必要动用权限更大的 PAT。
+
+on:
+  schedule:
+    - cron: '0 10 * * 1'   # 每周一 18:00 (Asia/Shanghai)，与 update_deps 的周五错开
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-dist
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  UPSTREAM_REPO: caddyserver/dist
+  UPSTREAM_REF: master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream assets
+        run: |
+          set -euo pipefail
+
+          SHA="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "$UPSTREAM_REF" | cut -f1)"
+          [ -n "$SHA" ] || { echo "::error::无法取得上游 HEAD"; exit 1; }
+          echo "上游 ${UPSTREAM_REPO}@${UPSTREAM_REF} = ${SHA}"
+          echo "UPSTREAM_SHA=$SHA" >> "$GITHUB_ENV"
+
+          BASE="https://raw.githubusercontent.com/${UPSTREAM_REPO}/${SHA}"
+          mkdir -p dist
+
+          # 按 SHA 而不是分支名取文件，保证这一轮拿到的两个文件来自同一个提交
+          fetch() {  # $1=上游相对路径 $2=本地路径 $3=必须包含的特征串
+            local tmp; tmp="$(mktemp)"
+            curl -fsSL --retry 3 -o "$tmp" "${BASE}/$1" \
+              || { echo "::error::下载失败: $1"; return 1; }
+            # 防止把 404 页面 / 空文件当成资产提交进来
+            [ -s "$tmp" ] || { echo "::error::$1 为空"; return 1; }
+            grep -qF "$3" "$tmp" || { echo "::error::$1 内容不符合预期（缺 '$3'）"; return 1; }
+            mv -f "$tmp" "$2"
+            echo "  ✓ $1 -> $2 ($(wc -c < "$2") bytes)"
+          }
+
+          fetch config/Caddyfile  dist/Caddyfile  'file_server'
+          fetch welcome/index.html dist/index.html '</html>'
+
+          cat > dist/UPSTREAM.md <<EOF
+          # dist/ 来源
+
+          本目录下的文件由 \`.github/workflows/sync_dist.yml\` 从上游自动同步，**请勿手改**。
+          它们不参与编译，只在 \`scripts/install.sh\` 部署时使用。
+
+          | 本地文件 | 上游路径 | 部署到 |
+          | :--- | :--- | :--- |
+          | \`dist/Caddyfile\` | \`config/Caddyfile\` | \`/etc/caddy/Caddyfile\`（仅当不存在时） |
+          | \`dist/index.html\` | \`welcome/index.html\` | \`/usr/share/caddy/index.html\` |
+
+          - 上游仓库：<https://github.com/${UPSTREAM_REPO}>
+          - 上游分支：\`${UPSTREAM_REF}\`
+          - 上游提交：[\`${SHA}\`](https://github.com/${UPSTREAM_REPO}/commit/${SHA})
+          - 同步时间：$(date '+%Y-%m-%d %H:%M:%S (Beijing)')
+          EOF
+
+      - name: Check for Changes
+        id: git-check
+        run: |
+          # UPSTREAM.md 里有时间戳，单独变化不算数 —— 只有资产本身变了才提交
+          if git diff --quiet dist/Caddyfile dist/index.html; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无变化"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff --stat dist/
+          fi
+
+      - name: Commit & Push
+        if: steps.git-check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/
+          git commit -m "chore(dist): sync from ${UPSTREAM_REPO}@${UPSTREAM_SHA:0:7}"
+          git pull --rebase --autostash
+          git push
+
+      - name: Summary
+        run: |
+          {
+            echo "### dist 同步结果"
+            echo ""
+            echo "- 上游: \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\`"
+            echo "- 资产变更: \`${{ steps.git-check.outputs.changed }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
