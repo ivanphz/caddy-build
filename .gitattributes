@@ -1,0 +1,14 @@
+# 统一换行符。
+# 这一条不是洁癖：plugins.txt 里一旦混进 CRLF，CI 生成的就是
+#   _ "github.com/foo/bar<CR>"
+# 编译直接失败，而且报错信息完全看不出是换行符的问题。
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.go        text eol=lf
+plugins.txt text eol=lf
+
+# 自动生成，在 diff 里默认折叠
+go.sum linguist-generated=true
