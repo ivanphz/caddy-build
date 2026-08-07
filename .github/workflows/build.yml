@@ -1,0 +1,211 @@
+name: Build Custom Caddy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    # 只看 go.mod / go.sum：main.go 的任何实质变更都必然伴随这两者变化，
+    # 单独改 main.go（比如 plugins.txt 只调了顺序）产出的二进制是一样的，不值得重建
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-caddy
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    outputs:
+      version_tag: ${{ steps.ver.outputs.tag }}
+      build_time: ${{ steps.ver.outputs.time }}
+    steps:
+      # 版本号只在这里生成一次，两个架构共用，避免跨分钟产生不同 tag
+      - name: Generate Global Version Tag
+        id: ver
+        run: |
+          echo "tag=v$(date +'%Y%m%d-%H%M')"                    >> "$GITHUB_OUTPUT"
+          echo "time=$(date +'%Y-%m-%d %H:%M:%S (Beijing)')"    >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: init
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            goos: linux
+            output_name: caddy-linux-amd64
+          - goarch: arm64
+            goos: linux
+            output_name: caddy-linux-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      # ============================================================
+      # 1. 编译
+      #    main.go / go.mod / go.sum 都由 update_deps.yml 生成并提交，
+      #    这里【不】跑 go mod tidy —— -mod=readonly（默认值）会在
+      #    依赖不完整时直接报错，而不是悄悄改写 go.sum 让构建不可复现。
+      # ============================================================
+      - name: Verify module is tidy
+        run: |
+          set -euo pipefail
+          test -f main.go || { echo "::error::缺少 main.go，请先手动跑一次 Update Dependencies"; exit 1; }
+          go mod download
+          go mod verify
+
+          # go mod tidy -diff (Go 1.23+)：只报告不改写。
+          # 这里失败通常意味着有人手改了 main.go 或 plugins.txt 却没跑 update_deps。
+          if go mod tidy -diff >/dev/null 2>&1; then
+            echo "✓ go.mod / go.sum 与 main.go 一致"
+          else
+            echo "::error::go.mod / go.sum 与 main.go 不一致，请先运行 Update Dependencies 工作流"
+            go mod tidy -diff || true
+            exit 1
+          fi
+
+      - name: Build Caddy (${{ matrix.goarch }})
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -mod=readonly \
+            -o "${{ matrix.output_name }}" \
+            -ldflags="-w -s -X github.com/caddyserver/caddy/v2.CustomVersion=${{ needs.init.outputs.version_tag }}" \
+            -trimpath \
+            -tags nobadger,nomysql,nopgx
+          ls -lh "${{ matrix.output_name }}"
+
+      # ============================================================
+      # 2. 冒烟测试（只有 amd64 能在 runner 上直接执行）
+      # ============================================================
+      - name: Smoke Test
+        if: matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          BIN="./${{ matrix.output_name }}"
+          chmod +x "$BIN"
+
+          echo "=== version ==="
+          VER="$("$BIN" version)"
+          echo "$VER"
+          case "$VER" in
+            "${{ needs.init.outputs.version_tag }}"*) echo "✓ CustomVersion 注入成功" ;;
+            *) echo "::error::CustomVersion 未注入，实际输出: $VER"; exit 1 ;;
+          esac
+
+          # 模块 ID 冲突会让 caddy 在 init 阶段 panic，list-modules 是最早的探针
+          echo "=== list-modules ==="
+          COUNT="$("$BIN" list-modules --versions | wc -l)"
+          echo "已注册模块数: $COUNT"
+          [ "$COUNT" -gt 100 ] || { echo "::error::模块数异常偏少，可能有插件没注册进去"; exit 1; }
+
+          # 非标准模块（即插件提供的）清单，方便肉眼核对
+          echo "=== non-standard modules ==="
+          "$BIN" list-modules --packages | grep -F 'github.com/' | grep -vF 'caddyserver/caddy' || true
+
+      # ============================================================
+      # 3. Release Notes（只在 amd64 生成）
+      # ============================================================
+      - name: Generate Release Notes
+        if: matrix.goarch == 'amd64'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_VERSION: ${{ needs.init.outputs.version_tag }}
+          BUILD_TIME: ${{ needs.init.outputs.build_time }}
+        run: |
+          go list -m -json all | jq -s '.' > go_modules.json
+
+          # 拉上一个 Release 的同名产物做对比；首次发布时不存在，回落到空数组
+          gh release download --pattern 'go_modules.json' --output prev_go_modules.json \
+            || echo '[]' > prev_go_modules.json
+
+          GO_VERSION="$(go version | awk '{print $3}')" python3 scripts/release_notes.py
+
+      - name: Generate Checksum
+        run: sha256sum "${{ matrix.output_name }}" > "${{ matrix.output_name }}.sha256"
+
+      # 二进制 + 校验和：两个架构都有
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: caddy-${{ matrix.goarch }}
+          if-no-files-found: error
+          path: |
+            ${{ matrix.output_name }}
+            ${{ matrix.output_name }}.sha256
+
+      # 元数据：只有 amd64 有，单独上传避免 arm64 刷 warning
+      - name: Upload Metadata
+        if: matrix.goarch == 'amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata
+          if-no-files-found: error
+          path: |
+            final_note.md
+            go_modules.json
+            main.go
+
+  release:
+    needs: [init, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Release Body
+        run: |
+          set -euo pipefail
+          cp artifacts/metadata/final_note.md body.md
+          {
+            echo ""
+            echo "### 🛡️ SHA256 Checksums"
+            echo '```'
+            cat artifacts/caddy-amd64/*.sha256
+            cat artifacts/caddy-arm64/*.sha256
+            echo '```'
+            echo ""
+            echo "### 📥 安装 / 更新"
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | sudo bash"
+            echo '```'
+          } >> body.md
+          cat body.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.init.outputs.version_tag }}
+          name: ${{ needs.init.outputs.version_tag }}
+          body_path: body.md
+          files: |
+            artifacts/caddy-amd64/caddy-linux-amd64
+            artifacts/caddy-amd64/caddy-linux-amd64.sha256
+            artifacts/caddy-arm64/caddy-linux-arm64
+            artifacts/caddy-arm64/caddy-linux-arm64.sha256
+            artifacts/metadata/go_modules.json
+            artifacts/metadata/main.go
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
