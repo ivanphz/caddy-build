@@ -1,0 +1,16 @@
+# 本地编译产物
+/caddy
+/caddy-linux-*
+*.sha256
+
+# CI 中间产物，正常不会进仓库，防手滑
+/go_modules.json
+/prev_go_modules.json
+/final_note.md
+/body.md
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
