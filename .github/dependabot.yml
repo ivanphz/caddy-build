@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # 只管 Actions 版本。原来 build-manual.yml 里躺着一个 softprops/action-gh-release@v1
+  # 就是没人盯导致的 —— 交给 dependabot 比人肉记靠谱。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+
+  # 刻意【不】开 gomod：Go 依赖由 update_deps.yml 从 plugins.txt 统一驱动，
+  # 两套机制同时改 go.mod 只会互相打架。
