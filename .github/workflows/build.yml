@@ -26,14 +26,47 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version_tag: ${{ steps.ver.outputs.tag }}
+      core_version: ${{ steps.ver.outputs.core }}
       build_time: ${{ steps.ver.outputs.time }}
     steps:
-      # 版本号只在这里生成一次，两个架构共用，避免跨分钟产生不同 tag
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 版本号只在这里生成一次，两个架构共用，避免跨分钟产生不同 tag。
+      #
+      # 格式:  v2.11.4-20260807.1930
+      #        └─上游核心─┘└─构建日期┘└时分┘
+      #
+      # 为什么带上核心版本：CustomVersion 会整个替换掉 Caddy 自报的版本，
+      # 纯时间戳会让 `caddy version` 完全看不出这是 2.11 还是 2.12 —— 而这
+      # 恰恰是查文档、搜报错时最先需要的信息。
+      #
+      # 为什么用日期而不是递增构建号：旧 release 会被自动清理，靠数已有
+      # release 来递增会重号。
+      #
+      # 为什么不把插件版本编进去：18 个插件会让 tag 长到没法读，且插件版本
+      # 已记录在 release notes、go_modules.json 和二进制的 caddy build-info 里。
+      # tag 是标识符，不是清单。
       - name: Generate Global Version Tag
         id: ver
         run: |
-          echo "tag=v$(date +'%Y%m%d-%H%M')"                    >> "$GITHUB_OUTPUT"
-          echo "time=$(date +'%Y-%m-%d %H:%M:%S (Beijing)')"    >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          CORE="$(awk '$1=="github.com/caddyserver/caddy/v2" && $2 ~ /^v[0-9]/ {print $2; exit}' go.mod)"
+          if [ -z "$CORE" ]; then
+            echo "::error::无法从 go.mod 解析 Caddy 核心版本"
+            exit 1
+          fi
+
+          TAG="${CORE}-$(date +'%Y%m%d.%H%M')"
+          echo "核心版本: ${CORE}"
+          echo "本次 tag: ${TAG}"
+
+          {
+            echo "core=${CORE}"
+            echo "tag=${TAG}"
+            echo "time=$(date +'%Y-%m-%d %H:%M:%S (Beijing)')"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: init
@@ -44,10 +77,8 @@ jobs:
         include:
           - goarch: amd64
             goos: linux
-            output_name: caddy-linux-amd64
           - goarch: arm64
             goos: linux
-            output_name: caddy-linux-arm64
 
     steps:
       - name: Checkout code
@@ -58,6 +89,10 @@ jobs:
         with:
           go-version: 'stable'
           check-latest: true
+
+      # 固定资产名，保住 releases/latest/download/caddy-linux-amd64 这个永久直链
+      - name: Resolve asset name
+        run: echo "ASSET=caddy-${{ matrix.goos }}-${{ matrix.goarch }}" >> "$GITHUB_ENV"
 
       # ============================================================
       # 1. 编译
@@ -88,12 +123,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          # 刻意【不】设 -X ...CustomVersion=：
+          # CustomVersion 会整个替换掉 Caddy 自报的版本。不设时 Caddy 从
+          # debug.ReadBuildInfo() 读依赖 caddy/v2 的版本，`caddy version`
+          # 输出与官方二进制、与 xcaddy 构建完全一致 —— 这个产物就是 Caddy，
+          # 只是多带插件，不应该伪装成另一个东西。
+          # release tag 是仓库侧的标识，由 install.sh 单独记录，不进二进制。
           go build -mod=readonly \
-            -o "${{ matrix.output_name }}" \
-            -ldflags="-w -s -X github.com/caddyserver/caddy/v2.CustomVersion=${{ needs.init.outputs.version_tag }}" \
+            -o "${{ env.ASSET }}" \
+            -ldflags="-w -s" \
             -trimpath \
             -tags nobadger,nomysql,nopgx
-          ls -lh "${{ matrix.output_name }}"
+          ls -lh "${{ env.ASSET }}"
 
       # ============================================================
       # 2. 冒烟测试（只有 amd64 能在 runner 上直接执行）
@@ -102,15 +143,19 @@ jobs:
         if: matrix.goarch == 'amd64'
         run: |
           set -euo pipefail
-          BIN="./${{ matrix.output_name }}"
+          BIN="./${{ env.ASSET }}"
           chmod +x "$BIN"
 
           echo "=== version ==="
           VER="$("$BIN" version)"
           echo "$VER"
+          # 必须与 go.mod 里的核心版本一致 —— 即与官方 caddy 输出同形
           case "$VER" in
-            "${{ needs.init.outputs.version_tag }}"*) echo "✓ CustomVersion 注入成功" ;;
-            *) echo "::error::CustomVersion 未注入，实际输出: $VER"; exit 1 ;;
+            "${{ needs.init.outputs.core_version }}"*)
+              echo "✓ caddy version 与上游一致" ;;
+            *)
+              echo "::error::期望以 ${{ needs.init.outputs.core_version }} 开头，实际: $VER"
+              exit 1 ;;
           esac
 
           # 模块 ID 冲突会让 caddy 在 init 阶段 panic，list-modules 是最早的探针
@@ -142,7 +187,7 @@ jobs:
           GO_VERSION="$(go version | awk '{print $3}')" python3 scripts/release_notes.py
 
       - name: Generate Checksum
-        run: sha256sum "${{ matrix.output_name }}" > "${{ matrix.output_name }}.sha256"
+        run: sha256sum "${{ env.ASSET }}" > "${{ env.ASSET }}.sha256"
 
       # 二进制 + 校验和：两个架构都有
       - name: Upload Binary
@@ -151,8 +196,8 @@ jobs:
           name: caddy-${{ matrix.goarch }}
           if-no-files-found: error
           path: |
-            ${{ matrix.output_name }}
-            ${{ matrix.output_name }}.sha256
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
 
       # 元数据：只有 amd64 有，单独上传避免 arm64 刷 warning
       - name: Upload Metadata
@@ -201,11 +246,140 @@ jobs:
           name: ${{ needs.init.outputs.version_tag }}
           body_path: body.md
           files: |
-            artifacts/caddy-amd64/caddy-linux-amd64
-            artifacts/caddy-amd64/caddy-linux-amd64.sha256
-            artifacts/caddy-arm64/caddy-linux-arm64
-            artifacts/caddy-arm64/caddy-linux-arm64.sha256
+            artifacts/caddy-amd64/*
+            artifacts/caddy-arm64/*
             artifacts/metadata/go_modules.json
             artifacts/metadata/main.go
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 每次成功发布后顺手清理旧版本。
+      # 留旧构建的代价不是存储（GitHub 对 release 总大小和带宽都无限制），而是
+      # 「一键降级」：一年前的二进制带着一年份未修补的 CVE，却能被 CADDY_TAG=
+      # 直接装回任何一台机器。保留数量可用仓库变量 KEEP_RELEASES 覆盖
+      #（Settings → Secrets and variables → Actions → Variables）。
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}   # 本 job 没有 checkout，gh 需要显式指定仓库
+          KEEP: ${{ vars.KEEP_RELEASES || 12 }}
+        run: |
+          set -euo pipefail
+
+          # 下限保护：无论变量填成什么，至少保留 3 个
+          [ "$KEEP" -ge 3 ] 2>/dev/null || KEEP=3
+
+          TOTAL="$(gh release list --limit 500 --json tagName --jq 'length')"
+          echo "现有 release: ${TOTAL}，保留最近 ${KEEP} 个"
+          if [ "$TOTAL" -le "$KEEP" ]; then
+            echo "无需清理"
+            exit 0
+          fi
+
+          # 按创建时间倒序后跳过前 KEEP 个。刚创建的这一个必然排第一，不会被误删；
+          # build.yml 的插件变更对比依赖 releases/latest 的 go_modules.json，必须保住。
+          gh release list --limit 500 --json tagName,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName" \
+          | while read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "  删除 $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            done
+
+          echo "剩余 release: $(gh release list --limit 500 --json tagName --jq 'length')"
+
+  # ================================================================
+  # 可选：把产物镜像到 Cloudflare R2，给受限网络提供第二条下载路径。
+  # 不设仓库变量 R2_BUCKET 就整个跳过，对默认使用者零影响。
+  #
+  # 为什么是 R2 而不是国内平台：本二进制编进了 forwardproxy(naive)/trojan，
+  # 推到需要实名认证的国内代码托管或对象存储上，风险不在技术层面。
+  #
+  # 需要配置（Settings → Secrets and variables → Actions）:
+  #   Variables: R2_BUCKET, R2_ACCOUNT_ID, R2_PREFIX(可选，默认 caddy-build)
+  #   Secrets:   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+  # ================================================================
+  mirror:
+    needs: [init, release]
+    runs-on: ubuntu-latest
+    if: vars.R2_BUCKET != ''
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required   # R2 不认 aws-chunked 校验和
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ vars.R2_BUCKET }}
+      PREFIX: ${{ vars.R2_PREFIX || 'caddy-build' }}
+      TAG: ${{ needs.init.outputs.version_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        run: |
+          set -euo pipefail
+          for a in artifacts/caddy-amd64/* artifacts/caddy-arm64/*; do
+            aws s3 cp --endpoint-url "$ENDPOINT" --only-show-errors \
+              "$a" "s3://${BUCKET}/${PREFIX}/${TAG}/$(basename "$a")"
+            echo "  ✓ ${TAG}/$(basename "$a")"
+          done
+
+      - name: Upload repo files
+        run: |
+          set -euo pipefail
+          # install.sh 和 dist/* 也镜像一份，这样受限网络下整条安装链路都不碰 GitHub
+          for f in scripts/install.sh dist/Caddyfile dist/index.html; do
+            aws s3 cp --endpoint-url "$ENDPOINT" --only-show-errors \
+              "$f" "s3://${BUCKET}/${PREFIX}/main/${f}"
+            echo "  ✓ main/${f}"
+          done
+
+          # R2 没有 releases/latest 这种 302，用一个纯文本指针代替
+          printf '%s\n' "$TAG" > latest.txt
+          aws s3 cp --endpoint-url "$ENDPOINT" --only-show-errors \
+            --cache-control 'max-age=300' \
+            latest.txt "s3://${BUCKET}/${PREFIX}/latest.txt"
+          echo "  ✓ latest.txt -> $TAG"
+
+      - name: Prune R2 to match GitHub retention
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # 不自己算保留策略 —— 直接以 GitHub 上还存在的 release 为准，
+          # 两边永远一致，也不用担心 tag 的字典序排不对（v2.9 vs v2.11）。
+          gh release list --limit 500 --json tagName --jq '.[].tagName' | sort -u > keep.txt
+          echo "GitHub 现存 release: $(wc -l < keep.txt) 个"
+
+          aws s3 ls --endpoint-url "$ENDPOINT" "s3://${BUCKET}/${PREFIX}/" \
+            | awk '$1=="PRE"{print $2}' | tr -d '/' | grep -v '^main$' > have.txt || true
+
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            if ! grep -qxF "$tag" keep.txt; then
+              echo "  删除 R2 目录 $tag"
+              aws s3 rm --endpoint-url "$ENDPOINT" --recursive --only-show-errors \
+                "s3://${BUCKET}/${PREFIX}/${tag}/"
+            fi
+          done < have.txt
+
+      - name: Summary
+        run: |
+          {
+            echo "### R2 镜像"
+            echo ""
+            echo '```bash'
+            echo "curl -fsSL https://<你的R2域名>/${PREFIX}/main/scripts/install.sh | sudo \\"
+            echo "  CADDY_RAW_BASE=https://<你的R2域名>/${PREFIX}/main \\"
+            echo "  CADDY_REL_BASE=https://<你的R2域名>/${PREFIX} \\"
+            echo "  CADDY_TAG_FILE=https://<你的R2域名>/${PREFIX}/latest.txt bash"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
