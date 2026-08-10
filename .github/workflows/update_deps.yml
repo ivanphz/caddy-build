@@ -54,9 +54,12 @@ jobs:
           done
 
           # ---- 2. 逐条处理 plugins.txt ----
-          declare -A seen
-          declare -a imports
-          declare -a failed
+          # 必须带 =() 初始化：`declare -a x` 只登记属性、不真正给变量赋值，
+          # 在 set -u 下 ${#x[@]} 会报 unbound variable。bash 4.4+ 对 ${x[@]}
+          # 放宽了检查但对 ${#x[@]} 没有，所以恰恰是「零失败」这条正常路径会炸。
+          declare -A seen=()
+          declare -a imports=()
+          declare -a failed=()
 
           # tr -d '\r'：防 CRLF 混入导致 import 里带 ^M
           while read -r line; do
