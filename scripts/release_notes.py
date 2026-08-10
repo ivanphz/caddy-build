@@ -165,8 +165,9 @@ def main():
         f"# {version}",
         "",
         "### 🚀 Build Info",
-        f"- **Custom Version**: `{version}`",
-        f"- **Caddy Core**: `{core.get('version', 'unknown')}`",
+        f"- **Release Tag**: `{version}`",
+        f"- **Caddy Core**: `{core.get('version', 'unknown')}` "
+        f"— 即 `caddy version` 的输出，与官方二进制同形",
         f"- **Go Version**: `{os.environ.get('GO_VERSION', 'unknown')}`",
         f"- **Plugins Count**: {len(tracked)}",
         f"- **Build Time**: {os.environ.get('BUILD_TIME', 'unknown')}",
