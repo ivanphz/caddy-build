@@ -1,4 +1,4 @@
-module github.com/ivanphz/my-custom-caddy
+module github.com/ivanphz/caddy-build
 
 go 1.25.8
 
