@@ -133,19 +133,24 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITEE_TOKEN }}
           OWNER_REPO: ${{ vars.GITEE_REPO }}      # 例: ivanabc/caddy-build
-          USER: ${{ vars.GITEE_USER }}            # git 推送用户名，例: ivanabc
+          # git 推送用户名默认从 OWNER_REPO 取斜杠前那段 —— 个人仓库的 owner
+          # 就是登录名。只有仓库属于「组织」时 owner ≠ 登录名，才需要设
+          # GITEE_USER 覆盖。刻意不叫 USER：那是 Unix 标准环境变量，
+          # 覆盖它等于给自己埋雷（不声明时它会是 runner，推送会静默用错用户名）。
+          GITEE_LOGIN: ${{ vars.GITEE_USER }}
           BRANCH: ${{ vars.GITEE_BRANCH || 'main' }}
           KEEP: ${{ vars.GITEE_KEEP || 5 }}
         run: |
           set -euo pipefail
           [ -n "$OWNER_REPO" ] || { echo "::error::请设置仓库变量 GITEE_REPO"; exit 1; }
-          [ -n "$USER" ] || { echo "::error::请设置仓库变量 GITEE_USER"; exit 1; }
+          LOGIN="${GITEE_LOGIN:-${OWNER_REPO%%/*}}"
+          echo "推送用户名: $LOGIN"
           API="https://gitee.com/api/v5/repos/${OWNER_REPO}"
           RAW="https://gitee.com/${OWNER_REPO}/raw/${BRANCH}"
           REL="https://gitee.com/${OWNER_REPO}/releases/download"
 
           echo "== 同步 README + install.sh =="
-          /tmp/sync_mirror.sh "https://${USER}:${TOKEN}@gitee.com/${OWNER_REPO}.git" \
+          /tmp/sync_mirror.sh "https://${LOGIN}:${TOKEN}@gitee.com/${OWNER_REPO}.git" \
             Gitee "$RAW" "$REL" "$TAG"
 
           echo "== 创建 release =="
