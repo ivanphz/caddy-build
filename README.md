@@ -42,6 +42,38 @@ sudo CADDY_TAG=v20260724-1930 caddy-update  # 装/回退到指定版本
 sudo NO_SERVICE=1 caddy-update              # 只更新二进制，不碰 systemd
 ```
 
+### 国内镜像
+
+每次发布后自动同步到两个国内平台（`mirror_cn.yml`），二进制、`install.sh` 和一份
+精简 README 都会推过去。镜像仓库不含源码、不含插件清单。
+
+**Gitee**
+
+```bash
+curl -fsSL https://gitee.com/ivanabc/caddy-build/raw/main/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://gitee.com/ivanabc/caddy-build/raw/main \
+  CADDY_REL_BASE=https://gitee.com/ivanabc/caddy-build/releases/download bash
+```
+
+**CNB**
+
+```bash
+curl -fsSL https://cnb.cool/ivanabc/caddy-build/-/raw/main/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://cnb.cool/ivanabc/caddy-build/-/raw/main \
+  CADDY_REL_BASE=https://cnb.cool/ivanabc/caddy-build/-/releases/download bash
+```
+
+两边的配额差两个数量级，保留策略因此不同：
+
+| | 附件配额 | 每 release 占用 | 保留数 |
+| :--- | ---: | ---: | ---: |
+| GitHub | 无限制 | 139 MB | 12 |
+| Gitee | **1 GB**（含仓库附件） | 139 MB | **5** |
+| CNB | 100 GiB（对象存储免费额度） | 139 MB | 12 |
+
+Gitee 是唯一瓶颈：7 个就到 966 MB，第 8 个直接爆配额，且失败会发生在上传中途、
+留下一个附件不全的 release。所以 `GITEE_KEEP` 默认 5 且必须真的执行删除。
+
 ### 下载来源
 
 脚本要拉两类东西，**它们的 URL 形状不同，所以是两个独立开关**：
