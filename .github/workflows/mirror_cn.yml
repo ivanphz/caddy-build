@@ -94,16 +94,17 @@ jobs:
           set -euo pipefail
           cat > /tmp/sync_mirror.sh <<'HELPER'
           #!/usr/bin/env bash
-          # $1=remote(含凭据) $2=平台名 $3=RAW_BASE $4=REL_BASE $5=TAG
+          # $1=remote(含凭据) $2=平台名 $3=RAW_BASE $4=REL_BASE $5=TAG $6=分支
           set -euo pipefail
+          BR="$6"
           rm -rf /tmp/work && mkdir -p /tmp/work/scripts && cd /tmp/work
-          git init -q -b main
+          git init -q -b "$BR"
           git config user.email 'actions@users.noreply.github.com'
           git config user.name  'mirror-bot'
           git remote add origin "$1"
           # 已有内容就接着提交，保留历史；空仓库则从零开始
-          if git fetch -q --depth 1 origin main 2>/dev/null; then
-            git reset -q --hard origin/main
+          if git fetch -q --depth 1 origin "$BR" 2>/dev/null; then
+            git reset -q --hard "origin/${BR}"
           fi
           mkdir -p scripts
           cp "$GITHUB_WORKSPACE/scripts/install.sh" scripts/install.sh
@@ -116,7 +117,7 @@ jobs:
             echo "  文件无变更，跳过推送"
           else
             git commit -qm "sync $5"
-            git push -q origin main
+            git push -q origin "HEAD:${BR}"
             echo "  ✓ 已同步 README.md + scripts/install.sh"
           fi
           HELPER
@@ -133,31 +134,48 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITEE_TOKEN }}
           OWNER_REPO: ${{ vars.GITEE_REPO }}      # 例: ivanabc/caddy-build
+          # 留空则自动探测远端默认分支 —— Gitee 建仓默认是 master，不是 main。
+          # 写死分支名是上一版最主要的坑。
           # git 推送用户名默认从 OWNER_REPO 取斜杠前那段 —— 个人仓库的 owner
           # 就是登录名。只有仓库属于「组织」时 owner ≠ 登录名，才需要设
           # GITEE_USER 覆盖。刻意不叫 USER：那是 Unix 标准环境变量，
           # 覆盖它等于给自己埋雷（不声明时它会是 runner，推送会静默用错用户名）。
           GITEE_LOGIN: ${{ vars.GITEE_USER }}
-          BRANCH: ${{ vars.GITEE_BRANCH || 'main' }}
+          BRANCH: ${{ vars.GITEE_BRANCH }}
           KEEP: ${{ vars.GITEE_KEEP || 5 }}
         run: |
           set -euo pipefail
           [ -n "$OWNER_REPO" ] || { echo "::error::请设置仓库变量 GITEE_REPO"; exit 1; }
           LOGIN="${GITEE_LOGIN:-${OWNER_REPO%%/*}}"
-          echo "推送用户名: $LOGIN"
+          REMOTE="https://${LOGIN}:${TOKEN}@gitee.com/${OWNER_REPO}.git"
           API="https://gitee.com/api/v5/repos/${OWNER_REPO}"
-          RAW="https://gitee.com/${OWNER_REPO}/raw/${BRANCH}"
+          HDR="Authorization: token ${TOKEN}"
+
+          # 探测远端默认分支。Gitee 建仓默认 master，写死 main 会推到一个
+          # 谁也看不见的新分支上，而仓库首页仍显示 master 的旧内容。
+          DET="$(git ls-remote --symref "$REMOTE" HEAD 2>/dev/null \
+                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+          BR="${BRANCH:-${DET:-main}}"
+          echo "推送用户名: $LOGIN    目标分支: $BR${DET:+（远端默认 $DET）}"
+
+          RAW="https://gitee.com/${OWNER_REPO}/raw/${BR}"
           REL="https://gitee.com/${OWNER_REPO}/releases/download"
 
           echo "== 同步 README + install.sh =="
-          /tmp/sync_mirror.sh "https://${LOGIN}:${TOKEN}@gitee.com/${OWNER_REPO}.git" \
-            Gitee "$RAW" "$REL" "$TAG"
+          /tmp/sync_mirror.sh "$REMOTE" Gitee "$RAW" "$REL" "$TAG" "$BR"
+
+          # 幂等：同名 release 先删掉再建，否则重跑会撞 tag。
+          # 附件挂在 release 上，删 release 等于连附件一起清干净。
+          OLD="$(curl -sS "${API}/releases/tags/${TAG}" -H "$HDR" | jq -r '.id // empty')"
+          if [ -n "$OLD" ]; then
+            echo "== 已存在同名 release id=$OLD，先删除 =="
+            curl -sS -o /dev/null -X DELETE "${API}/releases/${OLD}" -H "$HDR"
+          fi
 
           echo "== 创建 release =="
-          RESP="$(curl -sS -X POST "${API}/releases" \
-            -H "Authorization: token ${TOKEN}" \
+          RESP="$(curl -sS -X POST "${API}/releases" -H "$HDR" \
             -H 'Content-Type: application/json' \
-            -d "$(jq -n --arg t "$TAG" --arg b "$(cat body.md)" --arg c "$BRANCH" \
+            -d "$(jq -n --arg t "$TAG" --arg b "$(cat body.md)" --arg c "$BR" \
                   '{tag_name:$t, name:$t, body:$b, target_commitish:$c, prerelease:false}')")"
           RID="$(echo "$RESP" | jq -r '.id // empty')"
           if [ -z "$RID" ]; then
@@ -166,25 +184,33 @@ jobs:
           echo "  release_id=$RID"
 
           echo "== 上传附件 =="
-          for a in $ASSETS; do
-            OUT="$(curl -sS -X POST "${API}/releases/${RID}/attach_files" \
-                   -H "Authorization: token ${TOKEN}" \
-                   -F "file=@dl/${a}")"
-            echo "$OUT" | jq -e '.id' >/dev/null 2>&1 \
-              || { echo "::error::上传 $a 失败: $(echo "$OUT" | head -c 400)"; exit 1; }
-            echo "  ✓ $a"
+          # 按体积从小到大：.sha256 只有 100 字节，先传它能在 2 秒内验证
+          # 端点是否正确，而不是等一个 69MB 的上传挂 10 分钟才发现路径写错。
+          # runner 在境外，跨境上传 69MB 可能很慢，所以给足超时并打印速率。
+          for a in $(ls -S -r $(printf 'dl/%s ' $ASSETS) | xargs -n1 basename); do
+            SZ="$(du -h "dl/${a}" | cut -f1)"
+            echo "  上传 ${a} (${SZ}) …"
+            OUT="$(curl -sS --max-time 1800 --retry 2 --retry-delay 5 \
+                   -w '\n  HTTP %{http_code} | 用时 %{time_total}s | 上行 %{speed_upload} B/s' \
+                   -X POST "${API}/releases/${RID}/attach_files" -H "$HDR" \
+                   -F "file=@dl/${a}")" || {
+                     echo "::error::上传 ${a} 超时或中断（跨境上传可能过慢）"; exit 1; }
+            echo "$OUT" | tail -1
+            echo "$OUT" | head -c 2000 | jq -e '.id' >/dev/null 2>&1 \
+              || { echo "::error::上传 ${a} 失败: $(echo "$OUT" | head -c 400)"; exit 1; }
+            echo "  ✓ ${a}"
           done
 
           echo "== 清理旧版本（保留 $KEEP）=="
-          curl -sS "${API}/releases?page=1&per_page=100" -H "Authorization: token ${TOKEN}" \
+          curl -sS "${API}/releases?page=1&per_page=100" -H "$HDR" \
             | jq -r 'sort_by(.id) | reverse | .['"$KEEP"':] | .[].id' \
             | while read -r id; do
                 [ -n "$id" ] || continue
                 echo "  删除 release id=$id"
-                curl -sS -o /dev/null -X DELETE "${API}/releases/${id}" -H "Authorization: token ${TOKEN}"
+                curl -sS -o /dev/null -X DELETE "${API}/releases/${id}" -H "$HDR"
               done
 
-          echo "下载地址: https://gitee.com/${OWNER_REPO}/releases/download/${TAG}/caddy-linux-amd64"
+          echo "下载地址: ${REL}/${TAG}/caddy-linux-amd64"
 
       # ==================================================================
       # CNB —— 三步预签名上传，不是 multipart POST：
@@ -199,24 +225,37 @@ jobs:
         env:
           TOKEN: ${{ secrets.CNB_TOKEN }}         # 需要 repo-release:rw 权限
           OWNER_REPO: ${{ vars.CNB_REPO }}        # 例: ivanabc/caddy-build
-          BRANCH: ${{ vars.CNB_BRANCH || 'main' }}
+          BRANCH: ${{ vars.CNB_BRANCH }}   # 留空则自动探测远端默认分支
           KEEP: ${{ vars.CNB_KEEP || 12 }}
         run: |
           set -euo pipefail
           [ -n "$OWNER_REPO" ] || { echo "::error::请设置仓库变量 CNB_REPO"; exit 1; }
           API="https://api.cnb.cool/${OWNER_REPO}/-/releases"
           AUTH="Authorization: Bearer ${TOKEN}"
-          RAW="https://cnb.cool/${OWNER_REPO}/-/raw/${BRANCH}"
+          # CNB 的 git 认证：用户名固定 cnb，密码填访问令牌，不支持 SSH
+          REMOTE="https://cnb:${TOKEN}@cnb.cool/${OWNER_REPO}.git"
+
+          DET="$(git ls-remote --symref "$REMOTE" HEAD 2>/dev/null \
+                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+          BR="${BRANCH:-${DET:-main}}"
+          echo "目标分支: $BR${DET:+（远端默认 $DET）}"
+
+          RAW="https://cnb.cool/${OWNER_REPO}/-/raw/${BR}"
           REL="https://cnb.cool/${OWNER_REPO}/-/releases/download"
 
           echo "== 同步 README + install.sh =="
-          # CNB 的 git 认证：用户名固定 cnb，密码填访问令牌，不支持 SSH
-          /tmp/sync_mirror.sh "https://cnb:${TOKEN}@cnb.cool/${OWNER_REPO}.git" \
-            CNB "$RAW" "$REL" "$TAG"
+          /tmp/sync_mirror.sh "$REMOTE" CNB "$RAW" "$REL" "$TAG" "$BR"
+
+          # 幂等：同名 release 先删再建
+          OLD="$(curl -sS "${API}/tags/${TAG}" -H "$AUTH" | jq -r '.id // empty')"
+          if [ -n "$OLD" ]; then
+            echo "== 已存在同名 release id=$OLD，先删除 =="
+            curl -sS -o /dev/null -X DELETE "${API}/${OLD}" -H "$AUTH"
+          fi
 
           echo "== 创建 release =="
           RESP="$(curl -sS -X POST "$API" -H "$AUTH" -H 'Content-Type: application/json' \
-            -d "$(jq -n --arg t "$TAG" --arg b "$(cat body.md)" --arg c "$BRANCH" \
+            -d "$(jq -n --arg t "$TAG" --arg b "$(cat body.md)" --arg c "$BR" \
                   '{tag_name:$t, name:$t, body:$b, target_commitish:$c, make_latest:"true"}')")"
           RID="$(echo "$RESP" | jq -r '.id // empty')"
           if [ -z "$RID" ]; then
@@ -225,7 +264,8 @@ jobs:
           echo "  release_id=$RID"
 
           echo "== 上传附件 =="
-          for a in $ASSETS; do
+          # 同样按体积从小到大：先用 100 字节的 .sha256 验证三步流程走得通
+          for a in $(ls -S -r $(printf 'dl/%s ' $ASSETS) | xargs -n1 basename); do
             SIZE="$(stat -c%s "dl/${a}")"
 
             U="$(curl -sS -X POST "${API}/${RID}/asset-upload-url" -H "$AUTH" \
@@ -237,8 +277,11 @@ jobs:
             [ -n "$UP" ] && [ -n "$VF" ] \
               || { echo "::error::取上传地址失败 $a: $(echo "$U" | head -c 400)"; exit 1; }
 
-            curl -sS -X PUT "$UP" --upload-file "dl/${a}" \
-              || { echo "::error::PUT 失败 $a"; exit 1; }
+            echo "  上传 ${a} ($(du -h "dl/${a}" | cut -f1)) …"
+            curl -sS --max-time 1800 --retry 2 --retry-delay 5 \
+              -w '  HTTP %{http_code} | 用时 %{time_total}s | 上行 %{speed_upload} B/s\n' \
+              -X PUT "$UP" --upload-file "dl/${a}" \
+              || { echo "::error::PUT 失败 ${a}（跨境上传可能过慢）"; exit 1; }
 
             # verify_url 形如 .../asset-upload-confirmation/{upload_token}/{asset_path}
             TAIL="${VF#*/asset-upload-confirmation/}"
@@ -259,7 +302,7 @@ jobs:
                 curl -sS -o /dev/null -X DELETE "${API}/${id}" -H "$AUTH"
               done
 
-          echo "下载地址: https://cnb.cool/${OWNER_REPO}/-/releases/download/${TAG}/caddy-linux-amd64"
+          echo "下载地址: ${REL}/${TAG}/caddy-linux-amd64"
 
       - name: Summary
         run: |
