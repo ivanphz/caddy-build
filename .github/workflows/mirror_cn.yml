@@ -124,7 +124,6 @@ jobs:
           chmod +x /tmp/sync_mirror.sh
 
 
-
       # ==================================================================
       # CNB —— 三步预签名上传，不是 multipart POST：
       #   1) POST .../asset-upload-url   拿 upload_url + verify_url
@@ -138,6 +137,7 @@ jobs:
         env:
           TOKEN: ${{ secrets.CNB_TOKEN }}         # 需要 repo-release:rw 权限
           OWNER_REPO: ${{ vars.CNB_REPO }}        # 例: ivanabc/caddy-build
+          ONLY: ${{ vars.CNB_ASSETS }}            # 留空 = 传全部
           BRANCH: ${{ vars.CNB_BRANCH }}   # 留空则自动探测远端默认分支
           KEEP: ${{ vars.CNB_KEEP || 12 }}
         run: |
@@ -145,6 +145,10 @@ jobs:
           [ -n "$OWNER_REPO" ] || { echo "::error::请设置仓库变量 CNB_REPO"; exit 1; }
           API="https://api.cnb.cool/${OWNER_REPO}/-/releases"
           AUTH="Authorization: Bearer ${TOKEN}"
+          # 必须显式声明 Accept —— curl 默认发 */*，CNB 直接回 406。
+          # 它的错误文案提的是 content type，但 406 的语义是内容协商，坑在这。
+          # CNB 官方 CLI 发的是 application/vnd.cnb.api+json，application/json 同样接受。
+          ACC='Accept: application/json'
           # CNB 的 git 认证：用户名固定 cnb，密码填访问令牌，不支持 SSH
           REMOTE="https://cnb:${TOKEN}@cnb.cool/${OWNER_REPO}.git"
 
@@ -160,14 +164,14 @@ jobs:
           /tmp/sync_mirror.sh "$REMOTE" CNB "$RAW" "$REL" "$TAG" "$BR"
 
           # 幂等：同名 release 先删再建
-          OLD="$(curl -sS "${API}/tags/${TAG}" -H "$AUTH" | jq -r '.id // empty')"
+          OLD="$(curl -sS "${API}/tags/${TAG}" -H "$AUTH" -H "$ACC" | jq -r '.id // empty')"
           if [ -n "$OLD" ]; then
             echo "== 已存在同名 release id=$OLD，先删除 =="
-            curl -sS -o /dev/null -X DELETE "${API}/${OLD}" -H "$AUTH"
+            curl -sS -o /dev/null -X DELETE "${API}/${OLD}" -H "$AUTH" -H "$ACC"
           fi
 
           echo "== 创建 release =="
-          RESP="$(curl -sS -X POST "$API" -H "$AUTH" -H 'Content-Type: application/json' \
+          RESP="$(curl -sS -X POST "$API" -H "$AUTH" -H "$ACC" -H 'Content-Type: application/json' \
             -d "$(jq -n --arg t "$TAG" --arg b "$(cat body.md)" --arg c "$BR" \
                   '{tag_name:$t, name:$t, body:$b, target_commitish:$c, make_latest:"true"}')")"
           RID="$(echo "$RESP" | jq -r '.id // empty')"
@@ -178,10 +182,10 @@ jobs:
 
           echo "== 上传附件 =="
           # 同样按体积从小到大：先用 100 字节的 .sha256 验证三步流程走得通
-          for a in $(ls -S -r $(printf 'dl/%s ' $ASSETS) | xargs -n1 basename); do
+          for a in $(ls -S -r $(printf 'dl/%s ' ${ONLY:-$ASSETS}) | xargs -n1 basename); do
             SIZE="$(stat -c%s "dl/${a}")"
 
-            U="$(curl -sS -X POST "${API}/${RID}/asset-upload-url" -H "$AUTH" \
+            U="$(curl -sS -X POST "${API}/${RID}/asset-upload-url" -H "$AUTH" -H "$ACC" \
                  -H 'Content-Type: application/json' \
                  -d "$(jq -n --arg n "$a" --argjson s "$SIZE" \
                        '{asset_name:$n, size:$s, overwrite:true, ttl:0}')")"
@@ -210,18 +214,18 @@ jobs:
             UPTOKEN="${TAIL%%/*}"
             APATH="${TAIL#*/}"
             curl -sS -o /dev/null -X POST \
-              "${API}/${RID}/asset-upload-confirmation/${UPTOKEN}/${APATH}?ttl=0" -H "$AUTH" \
+              "${API}/${RID}/asset-upload-confirmation/${UPTOKEN}/${APATH}?ttl=0" -H "$AUTH" -H "$ACC" \
               || { echo "::error::确认失败 $a"; exit 1; }
             echo "  ✓ $a"
           done
 
           echo "== 清理旧版本（保留 $KEEP）=="
-          curl -sS "${API}?page=1&page_size=100" -H "$AUTH" \
+          curl -sS "${API}?page=1&page_size=100" -H "$AUTH" -H "$ACC" \
             | jq -r '(.items // .) | sort_by(.created_at) | reverse | .['"$KEEP"':] | .[].id' \
             | while read -r id; do
                 [ -n "$id" ] || continue
                 echo "  删除 release id=$id"
-                curl -sS -o /dev/null -X DELETE "${API}/${id}" -H "$AUTH"
+                curl -sS -o /dev/null -X DELETE "${API}/${id}" -H "$AUTH" -H "$ACC"
               done
 
           echo "下载地址: ${REL}/${TAG}/caddy-linux-amd64"
