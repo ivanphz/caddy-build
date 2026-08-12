@@ -7,6 +7,10 @@ name: Mirror to CN platforms
 #   - go_modules.json / main.go —— 这两个会完整列出全部插件
 #   - GitHub 那份 release notes —— 里面有插件版本表格
 #
+# Gitee 支持 SSH 中转（实测 runner 直传 <75 KB/s 且卡死，香港机器 3000 KB/s）：
+# 只有 72MB 的上传腿走中转机，建 release / 清理旧版本等控制面仍在 runner 上跑。
+# CNB 直连即可（runner 实测 366 KB/s），不需要中转。
+#
 # 但要清楚一件事：二进制本身会暴露插件。Go 把依赖清单写在 buildinfo 段里，
 # `-ldflags "-w -s"` 剥不掉，`strings caddy | grep forwardproxy` 直接命中，
 # 不需要运行它。所以不同步清单只降低仓库页面的关键词可发现性，
@@ -187,6 +191,13 @@ jobs:
           # 只传校验和（例: "caddy-linux-amd64.sha256 caddy-linux-arm64.sha256"），
           # 让 Gitee 只承担 install.sh + README 的分发。
           ONLY: ${{ vars.GITEE_ASSETS }}
+          # ---- SSH 中转（留空 = 直连）----
+          RELAY_HOST: ${{ vars.GITEE_RELAY_HOST }}
+          RELAY_USER: ${{ vars.GITEE_RELAY_USER || 'root' }}
+          RELAY_PORT: ${{ vars.GITEE_RELAY_PORT || '22' }}
+          RELAY_KEY: ${{ secrets.GITEE_RELAY_KEY }}
+          RELAY_KNOWN_HOSTS: ${{ vars.GITEE_RELAY_KNOWN_HOSTS }}
+          GH_REPO_FULL: ${{ github.repository }}
           # 留空则自动探测远端默认分支 —— Gitee 建仓默认是 master，不是 main。
           # 写死分支名是上一版最主要的坑。
           # git 推送用户名默认从 OWNER_REPO 取斜杠前那段 —— 个人仓库的 owner
@@ -237,32 +248,145 @@ jobs:
           echo "  release_id=$RID"
 
           source /tmp/progress.sh
-          echo "== 上传附件 =="
-          # 按体积从小到大：.sha256 只有 100 字节，先传它能在 2 秒内验证
-          # 端点是否正确，而不是等一个 69MB 的上传挂 10 分钟才发现路径写错。
-          # runner 在境外，跨境上传 69MB 可能很慢，所以给足超时并打印速率。
-          for a in $(ls -S -r $(printf 'dl/%s ' ${ONLY:-$ASSETS}) | xargs -n1 basename); do
-            SZ="$(du -h "dl/${a}" | cut -f1)"
-            echo "  上传 ${a} (${SZ}) …"
-            # 响应体写文件，变量只接 -w 的统计 —— 混在一起会让 jq 解析完 JSON
-            # 之后撞上统计文本而报错，把一次成功的上传误判成失败。
-            progress_start
-            STAT="$(curl -S --max-time 1800 --retry 2 --retry-delay 5 \
-                    -o /tmp/resp.json \
-                    -w '%{http_code}|%{time_total}|%{speed_upload}' \
-                    -X POST "${API}/releases/${RID}/attach_files" -H "$HDR" \
-                    -F "file=@dl/${a}" 2>"$PROG_ERRF")" || {
-                      progress_stop
-                      echo "::error::上传 ${a} 超时或中断: $(progress_tail)"
-                      progress_cleanup; exit 1; }
-            progress_stop; progress_cleanup
-            IFS='|' read -r HTTP SECS SPD <<< "$STAT"
-            printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
-                   "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
-            jq -e '.id' /tmp/resp.json >/dev/null 2>&1 \
-              || { echo "::error::上传 ${a} 失败 (HTTP $HTTP): $(head -c 400 /tmp/resp.json)"; exit 1; }
-            echo "  ✓ ${a}"
+          # 按体积从小到大：.sha256 只有几十字节，先传它能在 2 秒内验证端点，
+          # 而不是等一个 69MB 的上传挂十分钟才发现路径写错。
+          UPLOADS="$(ls -S -r $(printf 'dl/%s ' ${ONLY:-$ASSETS}) | xargs -n1 basename | tr '\n' ' ')"
+
+          if [ -n "$RELAY_HOST" ] && [ -n "$RELAY_KEY" ]; then
+            # ============================================================
+            # SSH 中转上传
+            # runner 只发几 KB 的指令，72MB 由中转机直接从 GitHub 拉再传 Gitee。
+            # 三条「不残留」保证：
+            #   1) 远端全部工作放在 mktemp -d，trap 覆盖 EXIT/HUP/INT/TERM，
+            #      连 SSH 断线（SIGHUP）也会清理
+            #   2) 脚本经 stdin 喂给 bash -s，不落远端磁盘
+            #   3) token 不进命令行（ps 可见），写成 curl 配置文件放在临时目录
+            # ============================================================
+            echo "== 上传附件（经 ${RELAY_USER}@${RELAY_HOST} 中转）=="
+
+            KEYF="$(mktemp)"; printf '%s\n' "$RELAY_KEY" > "$KEYF"; chmod 600 "$KEYF"
+            KH="$(mktemp)"
+            SSHOPT=(-i "$KEYF" -p "$RELAY_PORT" -o BatchMode=yes -o ConnectTimeout=20
+                    -o ServerAliveInterval=30 -o ServerAliveCountMax=6
+                    -o UserKnownHostsFile="$KH")
+            if [ -n "$RELAY_KNOWN_HOSTS" ]; then
+              printf '%s\n' "$RELAY_KNOWN_HOSTS" > "$KH"
+              SSHOPT+=(-o StrictHostKeyChecking=yes)
+            else
+              ssh-keyscan -p "$RELAY_PORT" -H "$RELAY_HOST" > "$KH" 2>/dev/null || true
+              echo "::warning::未设置 GITEE_RELAY_KNOWN_HOSTS，已用 ssh-keyscan 接受主机指纹（存在中间人风险）。建议在中转机上跑 ssh-keyscan -p ${RELAY_PORT} <host> 并把输出填进该变量。"
+            fi
+
+            RELAY="$(mktemp)"
+            {
+              # 参数用 printf %q 传，token 含任何特殊字符都能安全还原；
+              # 脚本体用带引号的 heredoc，不会在 runner 侧被展开。
+              printf 'TOKEN=%q\n'    "$TOKEN"
+              printf 'API=%q\n'      "$API"
+              printf 'RID=%q\n'      "$RID"
+              printf 'ASSETS=%q\n'   "$UPLOADS"
+              printf 'GH_BASE=%q\n'  "https://github.com/${GH_REPO_FULL}/releases/download/${TAG}"
+              printf 'SHA_LINES=%q\n' "$(cat dl/*.sha256)"
+              printf 'INTERVAL=%q\n' "${PROGRESS_INTERVAL:-15}"
+              cat <<'REMOTE'
+          set -euo pipefail
+          command -v curl >/dev/null || { echo "远端缺少 curl"; exit 1; }
+          umask 077
+          WORK="$(mktemp -d)"
+          # 覆盖 HUP：SSH 连接断开时远端进程收到的就是 SIGHUP
+          trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+          cd "$WORK"
+
+          echo "    中转机 $(uname -n) $(uname -m)   工作目录 $WORK"
+          AVAIL="$(df -Pm . | awk 'NR==2{print $4}')"
+          [ "${AVAIL:-0}" -ge 300 ] || { echo "远端可用空间不足 300MB (${AVAIL}MB)"; exit 1; }
+
+          # token 走 curl 配置文件，不进命令行 —— 否则整个上传期间
+          # 任何用户 ps 一下就能看到它
+          printf 'header = "Authorization: token %s"\n' "$TOKEN" > cfg
+          printf '%s\n' "$SHA_LINES" > SHA256SUMS
+
+          progress_watch() {
+            local last="" line
+            while :; do
+              sleep "$INTERVAL"
+              [ -s "$1" ] || continue
+              line="$(tr '\r' '\n' < "$1" | awk 'NF>=12 && $1 ~ /^[0-9]+$/' | tail -n1)"
+              { [ -z "$line" ] || [ "$line" = "$last" ]; } && continue
+              last="$line"
+              printf '%s\n' "$line" \
+                | awk '{printf "      %s%%  %s/%s   当前 %s/s   剩余 %s\n", $5, $6, $2, $12, $11}'
+            done
+          }
+          PE=""; PP=""
+          pstart() { PE="$(mktemp -p "$WORK")"; progress_watch "$PE" & PP=$!; }
+          pstop()  { [ -n "$PP" ] && kill "$PP" 2>/dev/null || true
+                     [ -n "$PP" ] && wait "$PP" 2>/dev/null || true; PP=""; }
+          ptail()  { [ -s "$PE" ] && tr '\r' '\n' < "$PE" | grep -v '^[[:space:]]*$' | tail -2 || true; }
+
+          for a in $ASSETS; do
+            echo "    ↓ GitHub → 中转机: $a"
+            pstart
+            curl -S -fL --retry 3 --retry-delay 3 --max-time 1800 \
+                 -o "$a" "${GH_BASE}/${a}" 2>"$PE" || { pstop; echo "下载失败 $a: $(ptail)"; exit 1; }
+            pstop
           done
+
+          # 校验和来自 runner 上已下载的那份，等于做了一次端到端一致性检查
+          sha256sum -c --ignore-missing SHA256SUMS \
+            || { echo "SHA256 校验失败，中止（不上传可疑文件）"; exit 1; }
+          echo "    ✓ SHA256 校验通过"
+
+          for a in $ASSETS; do
+            echo "    ↑ 中转机 → Gitee: $a ($(du -h "$a" | cut -f1))"
+            pstart
+            STAT="$(curl -S -K cfg --max-time 1800 --retry 2 --retry-delay 5 \
+                    -o resp.json -w '%{http_code}|%{time_total}|%{speed_upload}' \
+                    -X POST "${API}/releases/${RID}/attach_files" \
+                    -F "file=@${a}" 2>"$PE")" || { pstop; echo "上传中断 $a: $(ptail)"; exit 1; }
+            pstop
+            IFS='|' read -r HTTP SECS SPD <<< "$STAT"
+            printf '      HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
+                   "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
+            # 不依赖远端有 jq
+            grep -q '"id"' resp.json \
+              || { echo "上传失败 $a (HTTP $HTTP): $(head -c 300 resp.json)"; exit 1; }
+            echo "      ✓ $a"
+          done
+          echo "    中转完成，临时目录将随本次会话一并清理"
+          REMOTE
+            } > "$RELAY"
+
+            ssh "${SSHOPT[@]}" "${RELAY_USER}@${RELAY_HOST}" 'bash -s' < "$RELAY" \
+              || { rm -f "$KEYF" "$KH" "$RELAY"; echo "::error::中转上传失败"; exit 1; }
+            rm -f "$KEYF" "$KH" "$RELAY"
+          else
+            # ============================================================
+            # 直连上传（未配置中转时）
+            # ============================================================
+            echo "== 上传附件（runner 直连）=="
+            for a in $UPLOADS; do
+              echo "  上传 ${a} ($(du -h "dl/${a}" | cut -f1)) …"
+              # 响应体写文件、变量只接 -w 的统计 —— 混在一起会让 jq 解析完 JSON
+              # 之后撞上统计文本而报错，把一次成功的上传误判成失败。
+              progress_start
+              STAT="$(curl -S --max-time 1800 --retry 2 --retry-delay 5 \
+                      -o /tmp/resp.json \
+                      -w '%{http_code}|%{time_total}|%{speed_upload}' \
+                      -X POST "${API}/releases/${RID}/attach_files" -H "$HDR" \
+                      -F "file=@dl/${a}" 2>"$PROG_ERRF")" || {
+                        progress_stop
+                        echo "::error::上传 ${a} 超时或中断: $(progress_tail)"
+                        progress_cleanup; exit 1; }
+              progress_stop; progress_cleanup
+              IFS='|' read -r HTTP SECS SPD <<< "$STAT"
+              printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
+                     "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
+              jq -e '.id' /tmp/resp.json >/dev/null 2>&1 \
+                || { echo "::error::上传 ${a} 失败 (HTTP $HTTP): $(head -c 400 /tmp/resp.json)"; exit 1; }
+              echo "  ✓ ${a}"
+            done
+          fi
 
           echo "== 清理旧版本（保留 GitHub 最新 $KEEP 个 tag）=="
           head -n "$KEEP" /tmp/gh_tags.txt > /tmp/keep.txt
