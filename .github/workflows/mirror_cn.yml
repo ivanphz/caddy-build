@@ -148,6 +148,26 @@ jobs:
                 | awk '{printf "    %s%%  %s/%s   当前 %s/s   剩余 %s\n", $5, $6, $2, $12, $11}'
             done
           }
+
+          # 启停必须封装。裸写 `kill $PID; wait $PID` 在 set -e 下会炸：
+          # wait 一个被 SIGTERM 杀掉的任务返回 143，set -e 据此终止整个脚本
+          # （表现为 step 退出码 143，且看不出任何原因）。
+          PROG_ERRF=""; PROG_PID=""
+          progress_start() {
+            PROG_ERRF="$(mktemp)"
+            progress_watch "$PROG_ERRF" "${PROGRESS_INTERVAL:-15}" &
+            PROG_PID=$!
+          }
+          progress_stop() {
+            [ -n "$PROG_PID" ] && kill "$PROG_PID" 2>/dev/null || true
+            [ -n "$PROG_PID" ] && wait "$PROG_PID" 2>/dev/null || true
+            PROG_PID=""
+          }
+          progress_tail() {   # 失败时回显 curl 最后几行 stderr
+            [ -s "$PROG_ERRF" ] && tr '\r' '\n' < "$PROG_ERRF" \
+              | grep -v '^[[:space:]]*$' | tail -2 || true
+          }
+          progress_cleanup() { [ -n "$PROG_ERRF" ] && rm -f "$PROG_ERRF" || true; }
           PROG
 
       # ==================================================================
@@ -226,17 +246,16 @@ jobs:
             echo "  上传 ${a} (${SZ}) …"
             # 响应体写文件，变量只接 -w 的统计 —— 混在一起会让 jq 解析完 JSON
             # 之后撞上统计文本而报错，把一次成功的上传误判成失败。
-            ERRF="$(mktemp)"
-            progress_watch "$ERRF" "$PROGRESS_INTERVAL" & WPID=$!
+            progress_start
             STAT="$(curl -S --max-time 1800 --retry 2 --retry-delay 5 \
                     -o /tmp/resp.json \
                     -w '%{http_code}|%{time_total}|%{speed_upload}' \
                     -X POST "${API}/releases/${RID}/attach_files" -H "$HDR" \
-                    -F "file=@dl/${a}" 2>"$ERRF")" || {
-                      kill $WPID 2>/dev/null
-                      echo "::error::上传 ${a} 超时或中断: $(tr '\r' '\n' < "$ERRF" | tail -2)"
-                      exit 1; }
-            kill $WPID 2>/dev/null; wait $WPID 2>/dev/null; rm -f "$ERRF"
+                    -F "file=@dl/${a}" 2>"$PROG_ERRF")" || {
+                      progress_stop
+                      echo "::error::上传 ${a} 超时或中断: $(progress_tail)"
+                      progress_cleanup; exit 1; }
+            progress_stop; progress_cleanup
             IFS='|' read -r HTTP SECS SPD <<< "$STAT"
             printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
                    "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
@@ -337,14 +356,14 @@ jobs:
             echo "  上传 ${a} ($(du -h "dl/${a}" | cut -f1)) …"
             # -o /dev/null：预签名存储的响应体没用，别刷屏。
             # curl 不带 -f 时 4xx 也返回 0，所以必须自己查状态码。
-            ERRF="$(mktemp)"
-            progress_watch "$ERRF" "$PROGRESS_INTERVAL" & WPID=$!
+            progress_start
             STAT="$(curl -S --max-time 1800 --retry 2 --retry-delay 5 \
                     -o /dev/null -w '%{http_code}|%{time_total}|%{speed_upload}' \
-                    -X PUT "$UP" --upload-file "dl/${a}" 2>"$ERRF")" \
-              || { kill $WPID 2>/dev/null
-                   echo "::error::PUT 失败 ${a}: $(tr '\r' '\n' < "$ERRF" | tail -2)"; exit 1; }
-            kill $WPID 2>/dev/null; wait $WPID 2>/dev/null; rm -f "$ERRF"
+                    -X PUT "$UP" --upload-file "dl/${a}" 2>"$PROG_ERRF")" \
+              || { progress_stop
+                   echo "::error::PUT 失败 ${a}: $(progress_tail)"
+                   progress_cleanup; exit 1; }
+            progress_stop; progress_cleanup
             IFS='|' read -r HTTP SECS SPD <<< "$STAT"
             printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
                    "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
