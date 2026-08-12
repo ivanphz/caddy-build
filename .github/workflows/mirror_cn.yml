@@ -217,8 +217,10 @@ jobs:
 
           # 探测远端默认分支。Gitee 建仓默认 master，写死 main 会推到一个
           # 谁也看不见的新分支上，而仓库首页仍显示 master 的旧内容。
+          # || true 不能省：set -e 下命令替换失败会终止整个 step，
+          # 而 2>/dev/null 已把原因吞掉 —— 表现为无任何输出的静默失败。
           DET="$(git ls-remote --symref "$REMOTE" HEAD 2>/dev/null \
-                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}' || true)"
           BR="${BRANCH:-${DET:-main}}"
           echo "推送用户名: $LOGIN    目标分支: $BR${DET:+（远端默认 $DET）}"
 
@@ -434,8 +436,10 @@ jobs:
           # CNB 的 git 认证：用户名固定 cnb，密码填访问令牌，不支持 SSH
           REMOTE="https://cnb:${TOKEN}@cnb.cool/${OWNER_REPO}.git"
 
+          # || true 不能省：set -e 下命令替换失败会终止整个 step，
+          # 而 2>/dev/null 已把原因吞掉 —— 表现为无任何输出的静默失败。
           DET="$(git ls-remote --symref "$REMOTE" HEAD 2>/dev/null \
-                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}' || true)"
           BR="${BRANCH:-${DET:-main}}"
           echo "目标分支: $BR${DET:+（远端默认 $DET）}"
 
