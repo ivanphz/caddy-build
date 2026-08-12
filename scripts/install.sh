@@ -14,6 +14,10 @@
 #   CADDY_REL_BASE=<url>            release 资产基址，完全自定义
 #   CADDY_TAG_URL=<url>             latest 版本解析地址（跟 302 取 tag，GitHub 用）
 #   CADDY_TAG_FILE=<url>            从纯文本文件读 tag（R2 / 自建源用，无 302 可跟）
+#   CADDY_MANIFEST=<url>            清单文件，直接给出每个资产的完整下载地址。
+#                                   给 URL 无法从 tag 推导的平台用（如 Gitee 的
+#                                   attach_files/{数字ID}/download/{名}）。设了它
+#                                   就同时覆盖 REL_BASE 和 TAG_FILE。
 #
 #   注意: jsDelivr 的 /gh/ 单文件上限 20 MB，且只服务 git 树、不碰 Releases。
 #   caddy 二进制约 69 MB，所以 CADDY_SOURCE 只改仓库文件来源，不改二进制来源。
@@ -58,16 +62,30 @@ RAW_BASE="${CADDY_RAW_BASE:-$RAW_DEFAULT}"
 REL_BASE="${CADDY_REL_BASE:-${GH_MIRROR}https://github.com/${REPO}/releases/download}"
 TAG_URL="${CADDY_TAG_URL:-${GH_MIRROR}https://github.com/${REPO}/releases/latest}"
 TAG_FILE="${CADDY_TAG_FILE:-}"   # 设了就优先用它，绕开 GitHub 的 302
+MANIFEST="${CADDY_MANIFEST:-}"   # 设了就优先用它，绕开一切 URL 拼接
+MANIFEST_CACHE=""                # 一次会话只拉一次
+TMPD=""                          # 全局临时目录，供 EXIT trap 清理
+
+# trap 在脚本退出时执行，那时函数的 local 变量早已出作用域。
+# 之前写成 trap 'rm -rf "$tmp"' EXIT，配合 set -u 会报 "tmp: unbound variable"。
+cleanup() {
+  [ -n "${TMPD:-}" ] && rm -rf "$TMPD" || true
+  [ -n "${MANIFEST_CACHE:-}" ] && rm -f "$MANIFEST_CACHE" || true
+}
+trap cleanup EXIT
 
 SELF_URL="${RAW_BASE}/scripts/install.sh"
 
 # ---------------------------------------------------------------- 工具函数
 
-c_red()  { printf '\033[31m%s\033[0m\n' "$*"; }
-c_grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
-c_ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
-info()   { printf '  %s\n' "$*"; }
-step()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+# 全部走 stderr。函数若用 stdout 返回值（如 fetch_binary 回显路径），
+# 混在一起会被 $(...) 一并捕获 —— 表现为 install 报
+# "cannot stat '  架构: amd64'..." 这种莫名其妙的错误。
+c_red()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+c_grn()  { printf '\033[32m%s\033[0m\n' "$*" >&2; }
+c_ylw()  { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+info()   { printf '  %s\n' "$*" >&2; }
+step()   { printf '\n\033[1m==> %s\033[0m\n' "$*" >&2; }
 die()    { c_red "错误: $*" >&2; exit 1; }
 
 need_root() {
@@ -75,7 +93,41 @@ need_root() {
 }
 
 raw_url() { printf '%s/%s' "$RAW_BASE" "$1"; }             # $1 = 仓库内相对路径
-rel_url() { printf '%s/%s/%s' "$REL_BASE" "$TAG" "$1"; }   # $1 = 资产文件名
+
+# 清单格式（tab 分隔，每行 key<TAB>value）:
+#   tag                       v2.11.4-20260807.1930
+#   caddy-linux-amd64         https://.../download/caddy-linux-amd64
+#   caddy-linux-amd64.sha256  https://.../download/caddy-linux-amd64.sha256
+# 用纯文本而非 JSON，是为了不给脚本引入 jq 依赖 —— 全程只用 curl/awk/sed。
+fetch_manifest() {
+  [ -n "$MANIFEST" ] || return 1
+  if [ -z "$MANIFEST_CACHE" ]; then
+    MANIFEST_CACHE="$(mktemp)"
+    curl -fsSL --retry 2 --max-time 30 "$MANIFEST" -o "$MANIFEST_CACHE" \
+      || die "无法拉取清单: $MANIFEST"
+    tr -d '\r' < "$MANIFEST_CACHE" > "${MANIFEST_CACHE}.clean" \
+      && mv -f "${MANIFEST_CACHE}.clean" "$MANIFEST_CACHE"
+  fi
+  printf '%s' "$MANIFEST_CACHE"
+}
+
+manifest_get() {
+  # $1 = key；未命中返回非零
+  local f v
+  f="$(fetch_manifest)" || return 1
+  v="$(awk -F'\t' -v k="$1" '$1==k{print $2; found=1; exit} END{exit !found}' "$f")" || return 1
+  [ -n "$v" ] || return 1
+  printf '%s' "$v"
+}
+
+rel_url() {
+  # $1 = 资产文件名。有清单就查表，否则按 基址/tag/文件名 拼。
+  if [ -n "$MANIFEST" ]; then
+    manifest_get "$1" || die "清单里没有资产 '$1'（$MANIFEST）"
+    return
+  fi
+  printf '%s/%s/%s' "$REL_BASE" "$TAG" "$1"
+}
 
 detect_arch() {
   case "$(uname -m)" in
@@ -87,6 +139,13 @@ detect_arch() {
 
 latest_tag() {
   local url tag
+
+  # 清单自带 tag，优先级最高
+  if [ -n "$MANIFEST" ]; then
+    tag="$(manifest_get tag)" || die "清单里缺少 tag 行: $MANIFEST"
+    printf '%s' "$tag"
+    return
+  fi
 
   # 自建源（R2 / 对象存储）没有 releases/latest 那种 302 可跟，用纯文本指针
   if [ -n "$TAG_FILE" ]; then
@@ -140,8 +199,10 @@ binary_matches_release() {
 
 # ---------------------------------------------------------------- 下载 + 校验
 
+FETCHED=""   # fetch_binary 的返回值走全局变量，不走 stdout
+
 fetch_binary() {
-  # $1 = 目标目录; 回显下载好的文件名
+  # $1 = 目标目录; 结果写入全局 FETCHED
   local dir="$1" arch asset
   arch="$(detect_arch)"
   asset="caddy-linux-${arch}"
@@ -164,7 +225,7 @@ fetch_binary() {
 
   chmod +x "${dir}/${asset}"
   "${dir}/${asset}" version >/dev/null 2>&1 || die "下载的二进制无法执行"
-  printf '%s' "${dir}/${asset}"
+  FETCHED="${dir}/${asset}"
 }
 
 install_binary() {
@@ -319,6 +380,7 @@ export CADDY_RAW_BASE="\${CADDY_RAW_BASE:-${RAW_BASE}}"
 export CADDY_REL_BASE="\${CADDY_REL_BASE:-${REL_BASE}}"
 export CADDY_TAG_URL="\${CADDY_TAG_URL:-${TAG_URL}}"
 export CADDY_TAG_FILE="\${CADDY_TAG_FILE:-${TAG_FILE}}"
+export CADDY_MANIFEST="\${CADDY_MANIFEST:-${MANIFEST}}"
 TMP="\$(mktemp)"
 trap 'rm -f "\$TMP"' EXIT
 curl -fsSL "${SELF_URL}" -o "\$TMP"
@@ -372,11 +434,11 @@ do_install() {
     step "安装 ${TAG}"
   fi
 
-  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  local newbin; newbin="$(fetch_binary "$tmp")"
+  TMPD="$(mktemp -d)"
+  fetch_binary "$TMPD"
 
   step "安装二进制"
-  install_binary "$newbin"
+  install_binary "$FETCHED"
   mkdir -p "$CONF_DIR"
   printf '%s\n' "$TAG" > "$STATE_FILE"
   chmod 0644 "$STATE_FILE"
@@ -452,7 +514,11 @@ do_status() {
   cv="$(caddy_version)"; it="$(installed_tag)"; lt="$(latest_tag)"
   printf '仓库           %s\n' "$REPO"
   printf '仓库文件源     %s\n' "$RAW_BASE"
-  printf 'release 源     %s\n' "$REL_BASE"
+  if [ -n "$MANIFEST" ]; then
+    printf 'release 源     清单 %s\n' "$MANIFEST"
+  else
+    printf 'release 源     %s\n' "$REL_BASE"
+  fi
   printf 'caddy version  %s\n' "${cv:-未安装}"
   printf '已装 release   %s\n' "${it:-未知（无状态文件）}"
   printf '源码 commit    %s\n' "$(source_commit || echo '未知')"
