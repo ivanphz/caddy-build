@@ -41,6 +41,7 @@ concurrency:
 
 env:
   TZ: Asia/Shanghai
+  PROGRESS_INTERVAL: '15'   # 上传进度打印间隔（秒）
   # 只镜像这四个。其余 release 资产（go_modules.json / main.go）留在 GitHub。
   ASSETS: 'caddy-linux-amd64 caddy-linux-amd64.sha256 caddy-linux-arm64 caddy-linux-arm64.sha256'
 
@@ -70,6 +71,12 @@ jobs:
           [ -n "$TAG" ] || { echo "::error::找不到可镜像的 release"; exit 1; }
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "镜像目标: $TAG"
+
+          # 保留策略的基准：GitHub 上现存的 tag，按新到旧。
+          # 镜像端只做集合差，不依赖它自己的排序 —— CNB 的 id 是超 2^53 的雪花号，
+          # jq 的 sort_by 按 double 比较会排错，进而删错 release。
+          gh release list --limit 500 --json tagName --jq '.[].tagName' > /tmp/gh_tags.txt
+          echo "GitHub 现存 release: $(wc -l < /tmp/gh_tags.txt) 个"
 
           mkdir -p dl && cd dl
           for a in $ASSETS; do
@@ -123,6 +130,138 @@ jobs:
           HELPER
           chmod +x /tmp/sync_mirror.sh
 
+          # 上传进度监视。curl 的进度表用 \r 覆盖同一行，直接进日志会刷屏，
+          # 所以转成换行后节流取最后一条。注意：curl 必须【不带 -s】——
+          # -s 会把进度表整个关掉（这是之前完全看不到进度的原因），
+          # 单用 -S 保留报错输出即可。
+          cat > /tmp/progress.sh <<'PROG'
+          progress_watch() {   # $1=curl的stderr文件 $2=间隔秒
+            local last="" line
+            while :; do
+              sleep "$2"
+              [ -s "$1" ] || continue
+              line="$(tr '\r' '\n' < "$1" | awk 'NF>=12 && $1 ~ /^[0-9]+$/' | tail -n1)"
+              { [ -z "$line" ] || [ "$line" = "$last" ]; } && continue
+              last="$line"
+              # 字段: 5=已传% 6=已传量 2=总量 12=当前速度 11=剩余时间
+              printf '%s\n' "$line" \
+                | awk '{printf "    %s%%  %s/%s   当前 %s/s   剩余 %s\n", $5, $6, $2, $12, $11}'
+            done
+          }
+          PROG
+
+      # ==================================================================
+      # Gitee
+      # 配额硬约束：单附件 ≤100M，【每仓库总附件 ≤1G，含仓库附件和发行版附件】。
+      # 每个 release 约 139MB → 最多 7 个就撑满，所以保留数默认 5，比 GitHub 那边紧。
+      # 不真删旧版本的话，某次推送会静默失败在配额上。
+      # ==================================================================
+      - name: Push to Gitee
+        # !cancelled() 而不是默认的 success()：两个镜像互相独立，
+        # 一边失败不该让另一边连试都不试。job 整体仍会标红。
+        if: ${{ !cancelled() && env.GITEE_TOKEN != '' }}
+        env:
+          TOKEN: ${{ secrets.GITEE_TOKEN }}
+          OWNER_REPO: ${{ vars.GITEE_REPO }}      # 例: ivanabc/caddy-build
+          # 留空 = 传全部。跨境上传 68MB 到 Gitee 实测走不通时，可以设成
+          # 只传校验和（例: "caddy-linux-amd64.sha256 caddy-linux-arm64.sha256"），
+          # 让 Gitee 只承担 install.sh + README 的分发。
+          ONLY: ${{ vars.GITEE_ASSETS }}
+          # 留空则自动探测远端默认分支 —— Gitee 建仓默认是 master，不是 main。
+          # 写死分支名是上一版最主要的坑。
+          # git 推送用户名默认从 OWNER_REPO 取斜杠前那段 —— 个人仓库的 owner
+          # 就是登录名。只有仓库属于「组织」时 owner ≠ 登录名，才需要设
+          # GITEE_USER 覆盖。刻意不叫 USER：那是 Unix 标准环境变量，
+          # 覆盖它等于给自己埋雷（不声明时它会是 runner，推送会静默用错用户名）。
+          GITEE_LOGIN: ${{ vars.GITEE_USER }}
+          BRANCH: ${{ vars.GITEE_BRANCH }}
+          KEEP: ${{ vars.GITEE_KEEP || 5 }}
+        run: |
+          set -euo pipefail
+          [ -n "$OWNER_REPO" ] || { echo "::error::请设置仓库变量 GITEE_REPO"; exit 1; }
+          LOGIN="${GITEE_LOGIN:-${OWNER_REPO%%/*}}"
+          REMOTE="https://${LOGIN}:${TOKEN}@gitee.com/${OWNER_REPO}.git"
+          API="https://gitee.com/api/v5/repos/${OWNER_REPO}"
+          HDR="Authorization: token ${TOKEN}"
+
+          # 探测远端默认分支。Gitee 建仓默认 master，写死 main 会推到一个
+          # 谁也看不见的新分支上，而仓库首页仍显示 master 的旧内容。
+          DET="$(git ls-remote --symref "$REMOTE" HEAD 2>/dev/null \
+                 | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')"
+          BR="${BRANCH:-${DET:-main}}"
+          echo "推送用户名: $LOGIN    目标分支: $BR${DET:+（远端默认 $DET）}"
+
+          RAW="https://gitee.com/${OWNER_REPO}/raw/${BR}"
+          REL="https://gitee.com/${OWNER_REPO}/releases/download"
+
+          echo "== 同步 README + install.sh =="
+          /tmp/sync_mirror.sh "$REMOTE" Gitee "$RAW" "$REL" "$TAG" "$BR"
+
+          # 幂等：同名 release 先删掉再建，否则重跑会撞 tag。
+          # 附件挂在 release 上，删 release 等于连附件一起清干净。
+          OLD="$(curl -sS "${API}/releases/tags/${TAG}" -H "$HDR" | jq -r '.id // empty')"
+          if [ -n "$OLD" ]; then
+            echo "== 已存在同名 release id=$OLD，先删除 =="
+            curl -sS -o /dev/null -X DELETE "${API}/releases/${OLD}" -H "$HDR"
+          fi
+
+          echo "== 创建 release =="
+          RESP="$(curl -sS -X POST "${API}/releases" -H "$HDR" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$TAG" --arg b "$(cat body.md)" --arg c "$BR" \
+                  '{tag_name:$t, name:$t, body:$b, target_commitish:$c, prerelease:false}')")"
+          RID="$(echo "$RESP" | jq -r '.id // empty')"
+          if [ -z "$RID" ]; then
+            echo "::error::创建失败: $(echo "$RESP" | head -c 500)"; exit 1
+          fi
+          echo "  release_id=$RID"
+
+          source /tmp/progress.sh
+          echo "== 上传附件 =="
+          # 按体积从小到大：.sha256 只有 100 字节，先传它能在 2 秒内验证
+          # 端点是否正确，而不是等一个 69MB 的上传挂 10 分钟才发现路径写错。
+          # runner 在境外，跨境上传 69MB 可能很慢，所以给足超时并打印速率。
+          for a in $(ls -S -r $(printf 'dl/%s ' ${ONLY:-$ASSETS}) | xargs -n1 basename); do
+            SZ="$(du -h "dl/${a}" | cut -f1)"
+            echo "  上传 ${a} (${SZ}) …"
+            # 响应体写文件，变量只接 -w 的统计 —— 混在一起会让 jq 解析完 JSON
+            # 之后撞上统计文本而报错，把一次成功的上传误判成失败。
+            ERRF="$(mktemp)"
+            progress_watch "$ERRF" "$PROGRESS_INTERVAL" & WPID=$!
+            STAT="$(curl -S --max-time 1800 --retry 2 --retry-delay 5 \
+                    -o /tmp/resp.json \
+                    -w '%{http_code}|%{time_total}|%{speed_upload}' \
+                    -X POST "${API}/releases/${RID}/attach_files" -H "$HDR" \
+                    -F "file=@dl/${a}" 2>"$ERRF")" || {
+                      kill $WPID 2>/dev/null
+                      echo "::error::上传 ${a} 超时或中断: $(tr '\r' '\n' < "$ERRF" | tail -2)"
+                      exit 1; }
+            kill $WPID 2>/dev/null; wait $WPID 2>/dev/null; rm -f "$ERRF"
+            IFS='|' read -r HTTP SECS SPD <<< "$STAT"
+            printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
+                   "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
+            jq -e '.id' /tmp/resp.json >/dev/null 2>&1 \
+              || { echo "::error::上传 ${a} 失败 (HTTP $HTTP): $(head -c 400 /tmp/resp.json)"; exit 1; }
+            echo "  ✓ ${a}"
+          done
+
+          echo "== 清理旧版本（保留 GitHub 最新 $KEEP 个 tag）=="
+          head -n "$KEEP" /tmp/gh_tags.txt > /tmp/keep.txt
+          if [ ! -s /tmp/keep.txt ]; then
+            echo "  ::warning::保留清单为空，跳过清理（避免误删全部）"
+          else
+            curl -sS "${API}/releases?page=1&per_page=100" -H "$HDR" \
+              | jq -r '.[] | "\(.id)\t\(.tag_name)"' \
+              | while IFS=$'\t' read -r id tag; do
+                  [ -n "$id" ] || continue
+                  if ! grep -qxF "$tag" /tmp/keep.txt; then
+                    echo "  删除 $tag (id=$id)"
+                    curl -sS -o /dev/null -X DELETE "${API}/releases/${id}" -H "$HDR"
+                  fi
+                done
+          fi
+
+          echo "下载地址: ${REL}/${TAG}/caddy-linux-amd64"
 
       # ==================================================================
       # CNB —— 三步预签名上传，不是 multipart POST：
@@ -180,6 +319,7 @@ jobs:
           fi
           echo "  release_id=$RID"
 
+          source /tmp/progress.sh
           echo "== 上传附件 =="
           # 同样按体积从小到大：先用 100 字节的 .sha256 验证三步流程走得通
           for a in $(ls -S -r $(printf 'dl/%s ' ${ONLY:-$ASSETS}) | xargs -n1 basename); do
@@ -197,10 +337,14 @@ jobs:
             echo "  上传 ${a} ($(du -h "dl/${a}" | cut -f1)) …"
             # -o /dev/null：预签名存储的响应体没用，别刷屏。
             # curl 不带 -f 时 4xx 也返回 0，所以必须自己查状态码。
-            STAT="$(curl -sS --max-time 1800 --retry 2 --retry-delay 5 \
+            ERRF="$(mktemp)"
+            progress_watch "$ERRF" "$PROGRESS_INTERVAL" & WPID=$!
+            STAT="$(curl -S --max-time 1800 --retry 2 --retry-delay 5 \
                     -o /dev/null -w '%{http_code}|%{time_total}|%{speed_upload}' \
-                    -X PUT "$UP" --upload-file "dl/${a}")" \
-              || { echo "::error::PUT 失败 ${a}（跨境上传可能过慢）"; exit 1; }
+                    -X PUT "$UP" --upload-file "dl/${a}" 2>"$ERRF")" \
+              || { kill $WPID 2>/dev/null
+                   echo "::error::PUT 失败 ${a}: $(tr '\r' '\n' < "$ERRF" | tail -2)"; exit 1; }
+            kill $WPID 2>/dev/null; wait $WPID 2>/dev/null; rm -f "$ERRF"
             IFS='|' read -r HTTP SECS SPD <<< "$STAT"
             printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
                    "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
@@ -219,14 +363,23 @@ jobs:
             echo "  ✓ $a"
           done
 
-          echo "== 清理旧版本（保留 $KEEP）=="
-          curl -sS "${API}?page=1&page_size=100" -H "$AUTH" -H "$ACC" \
-            | jq -r '(.items // .) | sort_by(.created_at) | reverse | .['"$KEEP"':] | .[].id' \
-            | while read -r id; do
-                [ -n "$id" ] || continue
-                echo "  删除 release id=$id"
-                curl -sS -o /dev/null -X DELETE "${API}/${id}" -H "$AUTH" -H "$ACC"
-              done
+          echo "== 清理旧版本（保留 GitHub 最新 $KEEP 个 tag）=="
+          head -n "$KEEP" /tmp/gh_tags.txt > /tmp/keep.txt
+          if [ ! -s /tmp/keep.txt ]; then
+            echo "  ::warning::保留清单为空，跳过清理（避免误删全部）"
+          else
+            # 列表接口返回的是裸数组（schema: type=array），没有 items 包装。
+            # .id 只做透传，jq 1.7 会保留字面量，不会丢雪花号精度。
+            curl -sS "${API}?page=1&page_size=100" -H "$AUTH" -H "$ACC" \
+              | jq -r '.[] | "\(.id)\t\(.tag_name)"' \
+              | while IFS=$'\t' read -r id tag; do
+                  [ -n "$id" ] || continue
+                  if ! grep -qxF "$tag" /tmp/keep.txt; then
+                    echo "  删除 $tag (id=$id)"
+                    curl -sS -o /dev/null -X DELETE "${API}/${id}" -H "$AUTH" -H "$ACC"
+                  fi
+                done
+          fi
 
           echo "下载地址: ${REL}/${TAG}/caddy-linux-amd64"
 
