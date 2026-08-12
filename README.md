@@ -74,6 +74,84 @@ curl -fsSL https://cnb.cool/ivanabc/caddy-build/-/raw/main/scripts/install.sh | 
 Gitee 是唯一瓶颈：7 个就到 966 MB，第 8 个直接爆配额，且失败会发生在上传中途、
 留下一个附件不全的 release。所以 `GITEE_KEEP` 默认 5 且必须真的执行删除。
 
+#### Gitee 走 SSH 中转
+
+GitHub runner 在境外，直传 Gitee 实测不到 75 KB/s 且会卡死；CNB 有 366 KB/s，够用。
+所以 **Gitee 的上传腿走中转机，CNB 直连**。
+
+只有 72MB 的上传走中转：建 release、清理旧版本等控制面仍在 runner 上跑。中转机直接
+从 GitHub 拉产物，runner 不碰大文件。
+
+| 类型 | 名称 | 说明 |
+| :--- | :--- | :--- |
+| Secret | `GITEE_RELAY_KEY` | 私钥全文（含 BEGIN/END 行） |
+| Variable | `GITEE_RELAY_HOST` | 中转机地址 |
+| Variable | `GITEE_RELAY_USER` | 默认 `root` |
+| Variable | `GITEE_RELAY_PORT` | 默认 `22` |
+| Variable | `GITEE_RELAY_KNOWN_HOSTS` | `ssh-keyscan -p 22 <host>` 的输出 |
+
+**不设 `GITEE_RELAY_HOST` 就自动回落到直连**，其余配置不变。
+
+```bash
+# 生成专用密钥（独立一把，泄露时好单独吊销）
+ssh-keygen -t ed25519 -f ~/.ssh/caddy_relay -N '' -C 'gh-actions-relay'
+ssh-copy-id -i ~/.ssh/caddy_relay.pub root@<中转机>
+
+cat ~/.ssh/caddy_relay      # → GITEE_RELAY_KEY
+ssh-keyscan -p 22 <中转机>   # → GITEE_RELAY_KNOWN_HOSTS
+```
+
+中转机上建议给这把钥匙加限制，它只需要执行 `bash -s`：
+
+```
+# ~/.ssh/authorized_keys，公钥前加 restrict
+restrict,pty ssh-ed25519 AAAA... gh-actions-relay
+```
+
+**中转机不留痕**，三条是设计保证：
+
+- 远端工作目录用 `mktemp -d`，`trap` 覆盖 `EXIT HUP INT TERM`，SSH 断线也会清理
+- 脚本经 stdin 喂给 `bash -s`，不落远端磁盘
+- token 走 curl 配置文件而非命令行（否则 `ps` 全程可见），随临时目录一起删
+
+中转机下载完还会用 runner 那份 `.sha256` 校验，等于给链路加了端到端一致性检查，
+校验不过就中止，不会把损坏的文件推上去。
+
+### 选中转机：必须实测
+
+`scripts/bench-mirror.sh` 用来测一台机器值不值得做中转。**不要凭地理位置猜** ——
+实测两台都在香港的机器，结果差了 80 倍：
+
+| 机器 | GitHub 下载 | → Gitee 上传 | 结论 |
+| :--- | ---: | ---: | :--- |
+| AWS 香港 | 快 | **3007 KB/s** | 可用，72MB 约 24 秒 |
+| 另一台香港 VPS | 106 MB/s | **13~39 KB/s** | 不可用 |
+| GitHub runner | — | <75 KB/s（卡死） | 不可用 |
+
+下载腿快不代表上传腿快，出海方向和回国方向是两条路由。
+
+```bash
+scp scripts/bench-mirror.sh root@<候选机>:/tmp/
+ssh root@<候选机>
+
+export GITEE_TOKEN=xxx CNB_TOKEN=yyy          # 别写进命令行，会留在 history 里
+/tmp/bench-mirror.sh dl    ivanphz/caddy-build              # GitHub → 本机
+/tmp/bench-mirror.sh gitee ivanabc/caddy-build "$GITEE_TOKEN"
+/tmp/bench-mirror.sh cnb   ivanabc/caddy-build "$CNB_TOKEN"
+```
+
+传 20MB 随机数据（随机是为了防中间环节压缩把速率测虚），带实时进度，完事自动删掉
+测试 release。判断标准：
+
+| 上行速率 | 结论 |
+| :--- | :--- |
+| > 1 MB/s | 适合做中转，72MB 约 1 分钟 |
+| 300~800 KB/s | 能用，单文件 2~4 分钟 |
+| < 150 KB/s | 不可用，换机器 |
+
+可选环境变量：`SIZE_MB`（默认 20）、`INTERVAL`（进度间隔，默认 3）、`PROXY`（走代理测，
+`curl --proxy` 语法）、`BRANCH`、`KEEP=1`（保留测试 release 便于排查）。
+
 ### 下载来源
 
 脚本要拉两类东西，**它们的 URL 形状不同，所以是两个独立开关**：
@@ -332,15 +410,23 @@ dist/Caddyfile                     → /etc/caddy/Caddyfile（仅当不存在时
 dist/index.html                    → /usr/share/caddy/index.html
 dist/UPSTREAM.md                   同步来源与上游 commit 记录
 
+mirror/README.md                   镜像仓库用的精简 README 模板
+                                   （占位符由 mirror_cn.yml 按平台替换）
+
 scripts/install.sh                 安装 / 更新 / 卸载
 scripts/release_notes.py           Release 正文生成
+scripts/bench-mirror.sh            镜像链路测速，选中转机用（不参与流水线）
 
 .github/workflows/update_deps.yml  依赖解析
 .github/workflows/build.yml        编译与发布
 .github/workflows/sync_dist.yml    从 caddyserver/dist 同步打包资产
+.github/workflows/mirror_cn.yml    同步到 Gitee / CNB
 .github/dependabot.yml             Actions 版本自动跟进（不管 Go 依赖）
 .gitattributes                     强制 LF，防 CRLF 混入 plugins.txt
 ```
+
+`scripts/bench-mirror.sh` 是运维工具不是流水线的一环 —— 放在仓库里是为了版本化管理、
+随手 `scp` 到候选机器上就能跑，本身不被任何 workflow 引用。
 
 三层职责：**根目录 = 构建输入与产物**，`dist/` = 部署资产（不参与编译），
 `scripts/` = 工具。
@@ -485,9 +571,16 @@ Variables 里加一个 `KEEP_RELEASES`，脚本内置下限为 3。
 
 ### 需要的 Secret
 
-| 名称 | 用途 |
-| :--- | :--- |
-| `PAT` | 一个有 `repo` 权限的 Personal Access Token。`Update Dependencies` 用它提交，因为 `GITHUB_TOKEN` 的推送不会触发 `build.yml` |
+| 名称 | 必需 | 用途 |
+| :--- | :--- | :--- |
+| `PAT` | 是 | 有 `repo` 权限的 Personal Access Token。`Update Dependencies` 用它提交 —— `GITHUB_TOKEN` 的推送不会触发 `build.yml` |
+| `GITEE_TOKEN` | 否 | Gitee 私人令牌，镜像用 |
+| `CNB_TOKEN` | 否 | CNB 访问令牌，需 `repo-release:rw` |
+| `GITEE_RELAY_KEY` | 否 | 中转机 SSH 私钥 |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | 否 | R2 镜像用 |
+
+对应的 Variables：`GITEE_REPO`、`CNB_REPO`、`GITEE_RELAY_HOST` 等，见各自章节。
+**任一镜像的 token 没配，对应的镜像任务整个跳过**，不影响主流程。
 
 ---
 
