@@ -119,13 +119,18 @@ curl -fsSL https://gitee.com/ivanabc/caddy-build/raw/master/scripts/install.sh |
   CADDY_MANIFEST=https://gitee.com/ivanabc/caddy-build/raw/master/manifest.txt bash
 ```
 
-**CNB**（默认 `main`）
+**CNB**（默认 `main`，注意 raw 路径是 `/-/git/raw/`）
 
 ```bash
-curl -fsSL https://cnb.cool/ivanabc/caddy-build/-/raw/main/scripts/install.sh | sudo \
-  CADDY_RAW_BASE=https://cnb.cool/ivanabc/caddy-build/-/raw/main \
-  CADDY_MANIFEST=https://cnb.cool/ivanabc/caddy-build/-/raw/main/manifest.txt bash
+curl -fsSL https://cnb.cool/ivanabc/caddy-build/-/git/raw/main/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://cnb.cool/ivanabc/caddy-build/-/git/raw/main \
+  CADDY_MANIFEST=https://cnb.cool/ivanabc/caddy-build/-/git/raw/main/manifest.txt bash
 ```
+
+> CNB 的 `/-/raw/` 会返回 **HTTP 200 + 一张 HTML 错误页**（软 404），
+> `curl -f` 拦不住，整页 HTML 会被喂进 `bash`，报的是
+> `syntax error near unexpected token '<'`。真实地址在网页上打开任意文件、
+> 点「复制路径 → 通过 cURL 下载」就能拿到；`/-/blob/` 是文件页不是原始内容。
 
 `manifest.txt` 里是流水线从各平台 API **实际拿到**的下载地址，对地址形状不做任何假设。
 Gitee 目前返回的是 `releases/download/{tag}/{文件名}`，和 GitHub 同形，所以

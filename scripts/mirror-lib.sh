@@ -59,6 +59,10 @@
 #   platform_fetch_asset <name> <url> <dst> 取回一个小文件用于校验
 #                        默认 = curl。私有存储桶用自己的凭据取（如 aws s3 cp），
 #                        免得为了做完整性校验被迫开公开读。
+#   platform_raw_candidates                 逐行打印候选 raw 基址（{BRANCH} 已替换）
+#                        定义了就会在推送后逐个探测，选中真正能取到内容的那个。
+#                        raw 的路径形状没有任何跨平台标准，猜错的表现极隐蔽 ——
+#                        见 probe_raw_base 的注释。
 # ============================================================================
 
 # ---- 输出 -------------------------------------------------------------------
@@ -280,6 +284,25 @@ assets_complete() {
   return 0
 }
 
+# 确认刚写进清单的下载地址真的能取到本次构建的产物。
+#
+# Gitee 的地址来自 API 返回的 browser_download_url，可信；但 CNB / R2 这类
+# 是按「基址/tag/文件名」自己拼的，拼错了照样能写进清单，直到几小时后
+# 有人装机才炸。.sha256 只有几十字节，拉回来逐字节比一下最便宜。
+verify_asset_urls() {
+  local name url
+  for name in $WANT_ASSETS; do
+    case "$name" in *.sha256) ;; *) continue ;; esac
+    url="$(manifest_url_of "$name")"
+    [ -n "$url" ] || mdie "${PLATFORM_NAME}: 清单里没有 ${name} 的地址"
+    fetch_asset "$name" "$url" "${MIRROR_TMPD}/verify" \
+      || mdie "${PLATFORM_NAME}: 清单里的地址取不到内容: ${url}"
+    cmp -s "${MIRROR_TMPD}/verify" "${DL_DIR}/${name}" \
+      || mdie "${PLATFORM_NAME}: ${url} 取回的内容与本次构建不一致"
+    mlog "✓ ${name} 地址可用"
+  done
+}
+
 # 按体积从小到大排。.sha256 只有几十字节，先传它能在 2 秒内验证端点，
 # 而不是等一个 69MB 的上传挂十分钟才发现路径写错。
 upload_order() {
@@ -389,6 +412,62 @@ git_sync_repo() {
 # 而且现场只剩一句「下载失败」，回溯成本极高 —— 实测栽过一次。
 #
 # 只警告不报错：产物已经传好了，缓存过一会儿自己会好；真推丢了下一次也会再推。
+# 判定一个 URL 是不是真的返回了我们要的东西。
+#
+# 只看 HTTP 200 是不够的：有平台对不存在的路径返回 200 + 一张 HTML "Page not found"，
+# 也就是软 404。实测 CNB 就是这样 —— curl -fsSL 不会报错，一整页 HTML 被直接
+# 喂进 bash，报的是 `syntax error near unexpected token '<'`，从错误信息完全
+# 看不出真正原因是地址形状写错了。
+#
+# 所以对内容有已知特征的文件，必须连内容一起验。
+url_serves() {   # $1=url $2=期望特征 shebang|manifest|any
+  local body code
+  body="$(curl -sSL --connect-timeout 20 --max-time 60 \
+          -w '\n%{http_code}' "$1" 2>/dev/null || true)"
+  code="$(printf '%s' "$body" | tail -n1)"
+  [ "$code" = 200 ] || { printf '%s' "$code"; return 1; }
+  case "$2" in
+    shebang)  printf '%s' "$body" | head -n1 | grep -q '^#!' || { printf 'soft404'; return 1; } ;;
+    manifest) printf '%s' "$body" | head -n1 | grep -q "^tag$(printf '\t')" || { printf 'soft404'; return 1; } ;;
+  esac
+  printf '200'
+}
+
+# 探测本平台真正可用的 raw 基址。
+#
+# 为什么探测而不是写死：raw 的路径形状各平台不一样，且没有任何标准 ——
+# Gitee 是 /raw/{分支}/，GitLab 系是 /-/raw/{分支}/，有的平台把「文件页地址」
+# 和「原始内容地址」分成两个完全不同的路径。猜错的表现是「推送全部成功、
+# 校验全绿、装机时 curl 拿回一张 HTML」，回溯成本极高。
+# 与其让人一轮轮猜，不如推完之后拿一个已知存在的文件挨个试。
+probe_raw_base() {
+  local cand url res cands
+  RAW_BASE_CHANGED=0
+  declare -F platform_raw_candidates >/dev/null 2>&1 || return 0
+
+  cands="$(platform_raw_candidates)"
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    url="${cand}/scripts/install.sh"
+    res="$(url_serves "$url" shebang)" && {
+      if [ "$cand" != "$RAW_BASE" ]; then
+        mlog "raw 基址改为 ${cand}（原先的 ${RAW_BASE} 取不到内容）"
+        RAW_BASE="$cand"
+        MANIFEST_URL="${RAW_BASE}/${MANIFEST_PATH}"
+        RAW_BASE_CHANGED=1
+      else
+        mlog "raw 基址: ${RAW_BASE}"
+      fi
+      return 0
+    }
+    mlog "✗ ${cand} → ${res}"
+  done <<CANDS
+${cands}
+CANDS
+
+  mdie "${PLATFORM_NAME}: 上面所有候选 raw 基址都取不到 scripts/install.sh。soft404 表示返回了 200 但内容不是脚本（多半是平台的 404 页面）。请在网页上打开该仓库的任意文件、点「原始数据 / Raw」，把地址前缀填进仓库变量。"
+}
+
 verify_repo_files() {
   local f url code pending="" round
   [ "${PLATFORM_PUBLIC_URLS:-1}" = 1 ] || return 0
@@ -399,8 +478,11 @@ verify_repo_files() {
     local still=""
     for f in $pending; do
       url="${RAW_BASE}/${f}"
-      code="$(curl -sSL -o /dev/null --connect-timeout 20 --max-time 60 \
-              -w '%{http_code}' "$url" 2>/dev/null || true)"
+      case "$f" in
+        */install.sh)     code="$(url_serves "$url" shebang)"  || true ;;
+        "$MANIFEST_PATH") code="$(url_serves "$url" manifest)" || true ;;
+        *)                code="$(url_serves "$url" any)"      || true ;;
+      esac
       if [ "$code" = 200 ]; then
         [ "$round" = 1 ] && mlog "✓ ${f}" || mlog "✓ ${f}（第二轮才读到，缓存刚刷新）"
       else
@@ -518,12 +600,22 @@ mirror_run() {
       grep -q "^${name}"$'\t' "$ASSET_URL_FILE" \
         || mdie "${PLATFORM_NAME}: ${name} 上传后没有拿到下载地址，清单会不完整"
     done
+    verify_asset_urls
   fi
 
   mstep "${PLATFORM_NAME}: 写清单并同步仓库"
   write_manifest
   MANIFEST_NOTE=" / ${MANIFEST_PATH}"
   sync_repo "$MIRROR_BRANCH" full
+
+  # 探测必须放在推送之后：候选地址要拿一个确实存在的文件来试
+  if [ "${PLATFORM_PUBLIC_URLS:-1}" = 1 ]; then
+    probe_raw_base
+    if [ "${RAW_BASE_CHANGED:-0}" = 1 ]; then
+      mlog "用新基址重新生成 README 再推一次"
+      sync_repo "$MIRROR_BRANCH" full
+    fi
+  fi
   verify_repo_files
 
   mstep "${PLATFORM_NAME}: 清理旧版本（保留 GitHub 最新 ${KEEP} 个 tag）"
