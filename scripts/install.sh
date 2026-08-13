@@ -211,8 +211,13 @@ latest_tag() {
 
   # 自建源（R2 / 对象存储）没有 releases/latest 那种 302 可跟，用纯文本指针
   if [ -n "$TAG_FILE" ]; then
-    tag="$(curl -fsSL --retry 2 --max-time 30 "$TAG_FILE" 2>/dev/null | head -n1 | tr -d '\r ')" \
+    # 不写成 `curl … | head -n1 | tr …`：head 读满一行就退出，curl 继续写就吃
+    # SIGPIPE，pipefail 于是把整条管道判为失败，明明取到了内容却走进 die。
+    # 先整个取回来，再用参数展开切首行。
+    tag="$(curl -fsSL --retry 2 --max-time 30 "$TAG_FILE" 2>/dev/null)" \
       || die "无法读取版本指针: $TAG_FILE"
+    tag="${tag%%$'\n'*}"
+    tag="${tag//[$'\r' ]/}"
     [ -n "$tag" ] || die "版本指针为空: $TAG_FILE"
     printf '%s' "$tag"
     return

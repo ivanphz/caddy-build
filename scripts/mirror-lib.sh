@@ -421,14 +421,29 @@ git_sync_repo() {
 #
 # 所以对内容有已知特征的文件，必须连内容一起验。
 url_serves() {   # $1=url $2=期望特征 shebang|manifest|any
-  local body code
+  local body code first
   body="$(curl -sSL --connect-timeout 20 --max-time 60 \
-          -w '\n%{http_code}' "$1" 2>/dev/null || true)"
-  code="$(printf '%s' "$body" | tail -n1)"
-  [ "$code" = 200 ] || { printf '%s' "$code"; return 1; }
+          -w $'\n%{http_code}' "$1" 2>/dev/null || true)"
+
+  # 全程用 bash 参数展开取首行和状态码，【不开管道】。
+  #
+  # 上一版写的是 `printf '%s' "$body" | head -n1 | grep -q '^#!'`，在 runner 上
+  # 稳定误判。原因是 grep -q 一匹配就退出 → head 收到 EPIPE 退出 → printf 再写
+  # 就收到 SIGPIPE(141)；set -o pipefail 于是把整条管道判为失败，
+  # 尽管 grep 实际上匹配成功了。表现是「文件明明能下、校验却说 soft404」。
+  # 小文件不会触发（printf 一次写完就结束了），所以 manifest.txt 通过、
+  # 24KB 的 install.sh 失败 —— 这种按体积分化的假阳性最难查。
+  #
+  # 同一个坑这个项目已经踩过两次（另一次是 `aws ls | grep -q .`）。
+  # 结论：pipefail 下不要把「会提前关闭读端的命令」放在管道里。
+  code="${body##*$'\n'}"
+  [ "$code" = 200 ] || { printf '%s' "${code:-000}"; return 1; }
+
+  first="${body%%$'\n'*}"
+  first="${first%$'\r'}"
   case "$2" in
-    shebang)  printf '%s' "$body" | head -n1 | grep -q '^#!' || { printf 'soft404'; return 1; } ;;
-    manifest) printf '%s' "$body" | head -n1 | grep -q "^tag$(printf '\t')" || { printf 'soft404'; return 1; } ;;
+    shebang)  case "$first" in '#!'*)          ;; *) printf 'soft404'; return 1 ;; esac ;;
+    manifest) case "$first" in "tag"$'\t'*)    ;; *) printf 'soft404'; return 1 ;; esac ;;
   esac
   printf '200'
 }
