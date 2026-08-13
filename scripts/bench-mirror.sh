@@ -7,6 +7,7 @@
 #   ./bench-mirror.sh gitee ivanabc/caddy-build "$GITEE_TOKEN"  # Gitee 上传速度
 #   ./bench-mirror.sh cnb   ivanabc/caddy-build "$CNB_TOKEN"    # CNB 上传速度
 #   ./bench-mirror.sh all   ...                                 # 见下方 all 用法
+#   ./bench-mirror.sh purge gitee ivanabc/caddy-build "$TOKEN"  # 清理遗留的 bench-* release
 #
 # 环境变量：
 #   SIZE_MB=20            测试文件大小，默认 20（正式产物约 72M，按比例外推即可）
@@ -15,7 +16,11 @@
 #   INTERVAL=3            进度打印间隔秒数，默认 3
 #   BRANCH=main           建测试 release 用的分支，留空自动探测
 #
-# 依赖：curl、jq。测完会自动清理临时 release 和本地文件。
+# 依赖：curl、jq。
+#
+# 测试 release 会在退出时删除，Ctrl-C / 被 kill / 中途报错也会删 —— 否则每中断
+# 一次就在 Gitee 上留下一个带 20MB 附件的 bench-* release，一直占着 1GB 附件配额。
+# 万一还是漏了（比如机器直接断电），用 purge 子命令一次性扫掉。
 #
 set -euo pipefail
 
@@ -25,7 +30,6 @@ KEEP="${KEEP:-0}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 TESTTAG="bench-${STAMP}"
 TMPD="$(mktemp -d)"
-trap 'rm -rf "$TMPD"' EXIT
 
 c()  { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 ok() { c 32 "$*"; }
@@ -36,13 +40,47 @@ die(){ er "错误: $*"; exit 1; }
 INTERVAL="${INTERVAL:-3}"
 
 # 控制类请求：静默
-CURL=(curl -sS --connect-timeout 20)
+CURL=(curl -sS --connect-timeout 20 --max-time 120)
 # 传输类请求：【不带 -s】—— -s 会把 curl 的进度表整个关掉。
 # 单用 -S 保留报错，进度表走 stderr，由 progress_watch 节流后打印。
 # --speed-limit/--speed-time: 平均速率低于 1KB/s 持续 60 秒就放弃。
 # 没有这个的话，链路卡死时会一直挂到 --max-time（30 分钟）才退出。
 XFER=(curl -S --connect-timeout 20 --speed-limit 1024 --speed-time 60)
 [ -n "$PROXY" ] && { CURL+=(--proxy "$PROXY"); XFER+=(--proxy "$PROXY"); }
+
+# ---------------------------------------------------------------- 清理
+# 建完测试 release 就登记，退出时（含 Ctrl-C）无条件删除。
+# 旧版把 DELETE 写在每个 bench_* 函数末尾，只要中途退出就删不掉 ——
+# 慢链路上手动 Ctrl-C 恰恰是最常见的路径。
+
+CLEAN_PLATFORM=""; CLEAN_API=""; CLEAN_ID=""; CLEAN_TOKEN=""
+
+release_delete() {   # $1=平台 $2=api $3=id $4=token
+  case "$1" in
+    gitee) "${CURL[@]}" -o /dev/null -X DELETE "${2}/releases/${3}" \
+             -H "Authorization: token ${4}" ;;
+    cnb)   "${CURL[@]}" -o /dev/null -X DELETE "${2}/${3}" \
+             -H "Authorization: Bearer ${4}" -H 'Accept: application/json' ;;
+    *)     return 1 ;;
+  esac
+}
+
+cleanup() {
+  if [ -n "$CLEAN_ID" ]; then
+    if [ "$KEEP" = 1 ]; then
+      wr "  已保留测试 release ${TESTTAG} (id=${CLEAN_ID})，用完请手动删除"
+    else
+      echo "  清理测试 release ${TESTTAG} (id=${CLEAN_ID}) …" >&2
+      release_delete "$CLEAN_PLATFORM" "$CLEAN_API" "$CLEAN_ID" "$CLEAN_TOKEN" \
+        || er "  ! 删除失败，请手动删除 ${TESTTAG}（它会一直占着附件配额）"
+    fi
+    CLEAN_ID=""
+  fi
+  rm -rf "$TMPD"
+}
+trap cleanup EXIT
+# INT/TERM/HUP 里 exit 会接着触发上面的 EXIT trap，清理逻辑只写一份
+trap 'er "已中断"; exit 130' INT TERM HUP
 
 # 注意：输出必须走 stderr。xfer 用 stdout 回传 "http|秒|速率"，而 xfer 本身
 # 是在 $(...) 里被调用的 —— 进度若打到 stdout，会连同统计一起被捕获进变量：
@@ -65,10 +103,14 @@ progress_watch() {   # $1=stderr文件 $2=间隔秒；输出到 stderr
 # 带进度地跑一次传输，回显 "http|秒|速率"
 xfer() {
   local errf pid stat
-  errf="$(mktemp)"
+  errf="$(mktemp -p "$TMPD")"
   progress_watch "$errf" "$INTERVAL" & pid=$!
   stat="$("${XFER[@]}" "$@" 2>"$errf")" || stat=""
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # kill 后 wait 一个被 SIGTERM 杀掉的任务返回 143。这里恰好在 $(...) 里，
+  # bash 默认不把 errexit 带进命令替换（需要 shopt -s inherit_errexit），
+  # 所以裸写没炸 —— 但这是巧合不是设计。补上 || true，换个调用位置也不会塌。
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   if [ -z "$stat" ]; then
     er "  传输中断（超时 / 失速 / 网络错误）:"
     tr '\r' '\n' < "$errf" | grep -v '^[[:space:]]*$' | tail -3 | sed 's/^/    /' >&2
@@ -103,6 +145,10 @@ bench_dl() {
   echo; c 36 "== GitHub 下载 ($repo) =="
   tag="$("${CURL[@]}" -I -o /dev/null -w '%{url_effective}' -L \
         "https://github.com/${repo}/releases/latest")" || die "解析 latest 失败"
+  case "$tag" in
+    */tag/*) ;;
+    *) die "从 ${tag} 解析不出 tag（代理可能改写了跳转）" ;;
+  esac
   tag="${tag##*/tag/}"
   url="https://github.com/${repo}/releases/download/${tag}/caddy-linux-amd64"
   echo "  版本: $tag"
@@ -130,6 +176,8 @@ bench_gitee() {
   rid="$(echo "$resp" | jq -r '.id // empty')"
   # 打印服务端原话，而不是替它猜原因
   [ -n "$rid" ] || die "创建测试 release 失败，服务端返回: $(echo "$resp" | head -c 400)"
+  # 登记给 cleanup —— 必须紧跟创建，中间任何一步中断都能删掉
+  CLEAN_PLATFORM=gitee; CLEAN_API="$api"; CLEAN_ID="$rid"; CLEAN_TOKEN="$token"
   echo "  测试 release id=$rid (分支 $br)"
 
   local stat
@@ -141,8 +189,6 @@ bench_gitee() {
   jq -e '.id' "$TMPD/resp.json" >/dev/null 2>&1 \
     || wr "  响应异常: $(head -c 200 "$TMPD/resp.json")"
   report "本机 → Gitee" "$SZ" "$T" "$SP"
-
-  [ "$KEEP" = 1 ] || "${CURL[@]}" -o /dev/null -X DELETE "${api}/releases/${rid}" -H "$hdr"
 }
 
 # ---------------------------------------------------------------- CNB 上传
@@ -174,6 +220,7 @@ bench_cnb() {
                '{tag_name:$t,name:$t,body:"bench",target_commitish:$c,make_latest:"false"}')")"
   rid="$(echo "$resp" | jq -r '.id // empty')"
   [ -n "$rid" ] || die "创建测试 release 失败，服务端返回: $(echo "$resp" | head -c 400)"
+  CLEAN_PLATFORM=cnb; CLEAN_API="$api"; CLEAN_ID="$rid"; CLEAN_TOKEN="$token"
   echo "  测试 release id=$rid"
 
   local u up vf size
@@ -198,8 +245,34 @@ bench_cnb() {
   tail_="${vf#*/asset-upload-confirmation/}"; tok="${tail_%%/*}"; path="${tail_#*/}"
   "${CURL[@]}" -o /dev/null -X POST \
     "${api}/${rid}/asset-upload-confirmation/${tok}/${path}?ttl=0" -H "$auth" -H "$acc" || true
+}
 
-  [ "$KEEP" = 1 ] || "${CURL[@]}" -o /dev/null -X DELETE "${api}/${rid}" -H "$auth" -H "$acc"
+# ---------------------------------------------------------------- 清理遗留
+
+purge() {   # $1=平台 $2=owner/repo $3=token
+  local plat="$1" repo="$2" token="$3" api list
+  echo; c 36 "== 清理 ${plat} 上遗留的 bench-* 测试 release ($repo) =="
+  case "$plat" in
+    gitee)
+      api="https://gitee.com/api/v5/repos/${repo}"
+      list="$("${CURL[@]}" "${api}/releases?page=1&per_page=100" \
+              -H "Authorization: token ${token}")" ;;
+    cnb)
+      api="https://api.cnb.cool/${repo}/-/releases"
+      list="$("${CURL[@]}" "${api}?page=1&page_size=100" \
+              -H "Authorization: Bearer ${token}" -H 'Accept: application/json')" ;;
+    *) die "purge 只支持 gitee / cnb" ;;
+  esac
+
+  local n=0 id tag
+  while IFS=$'\t' read -r id tag; do
+    [ -n "$id" ] || continue
+    echo "  删除 $tag (id=$id)"
+    release_delete "$plat" "$api" "$id" "$token" || wr "    删除失败"
+    n=$((n + 1))
+  done < <(printf '%s' "$list" \
+           | jq -r '.[] | select(.tag_name | startswith("bench-")) | "\(.id)\t\(.tag_name)"')
+  echo "  共清理 ${n} 个"
 }
 
 # ---------------------------------------------------------------- 入口
@@ -211,12 +284,16 @@ case "${1:-}" in
   dl)    bench_dl "${2:?用法: $0 dl <github owner/repo>}" ;;
   gitee) bench_gitee "${2:?缺少 owner/repo}" "${3:?缺少 token}" ;;
   cnb)   bench_cnb "${2:?缺少 owner/repo}" "${3:?缺少 token}" ;;
+  purge) purge "${2:?用法: $0 purge <gitee|cnb> <owner/repo> <token>}" \
+               "${3:?缺少 owner/repo}" "${4:?缺少 token}"; exit 0 ;;
   all)
     # 用法: ./bench-mirror.sh all <gh_repo> <cn_repo> <gitee_token> <cnb_token>
-    bench_dl "${2:?}"; bench_gitee "${3:?}" "${4:?}"; bench_cnb "${3}" "${5:?}"
+    bench_dl "${2:?}"; bench_gitee "${3:?}" "${4:?}"
+    cleanup                       # 先删掉 Gitee 那个，再登记 CNB 的
+    bench_cnb "${3}" "${5:?}"
     ;;
   *)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit 1 ;;
 esac
 

@@ -38,30 +38,47 @@ sudo caddy-update
 ```bash
 sudo caddy-update status                    # 看当前版本 / 最新版本 / 服务状态
 sudo caddy-update uninstall                 # 卸载二进制和服务（保留配置与数据）
-sudo CADDY_TAG=v20260724-1930 caddy-update  # 装/回退到指定版本
+sudo CADDY_TAG=v2.11.4-20260807.1930 caddy-update  # 装/回退到指定版本
 sudo NO_SERVICE=1 caddy-update              # 只更新二进制，不碰 systemd
 ```
 
 ### 国内镜像
 
-每次发布后自动同步到两个国内平台（`mirror_cn.yml`），二进制、`install.sh` 和一份
-精简 README 都会推过去。镜像仓库不含源码、不含插件清单。
+每次发布后由 `build.yml` 调用 `mirror.yml` 自动同步到两个国内平台，二进制、
+`install.sh`、一份精简 README 和一个 `manifest.txt` 都会推过去。镜像仓库不含源码、
+不含插件清单。
 
-**Gitee**
+**注意分支**：Gitee 建仓默认 `master`，CNB 默认 `main`，两边的 raw 路径因此不同。
+流水线每次都会探测远端默认分支并把正确的地址写进镜像仓库的 README 和运行摘要 ——
+下面这两条命令以实际探测结果为准，改过分支就照镜像仓库首页那份。
+
+**Gitee**（默认 `master`）
 
 ```bash
-curl -fsSL https://gitee.com/ivanabc/caddy-build/raw/main/scripts/install.sh | sudo \
-  CADDY_RAW_BASE=https://gitee.com/ivanabc/caddy-build/raw/main \
-  CADDY_REL_BASE=https://gitee.com/ivanabc/caddy-build/releases/download bash
+curl -fsSL https://gitee.com/ivanabc/caddy-build/raw/master/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://gitee.com/ivanabc/caddy-build/raw/master \
+  CADDY_MANIFEST=https://gitee.com/ivanabc/caddy-build/raw/master/manifest.txt bash
 ```
 
-**CNB**
+**CNB**（默认 `main`）
 
 ```bash
 curl -fsSL https://cnb.cool/ivanabc/caddy-build/-/raw/main/scripts/install.sh | sudo \
   CADDY_RAW_BASE=https://cnb.cool/ivanabc/caddy-build/-/raw/main \
-  CADDY_REL_BASE=https://cnb.cool/ivanabc/caddy-build/-/releases/download bash
+  CADDY_MANIFEST=https://cnb.cool/ivanabc/caddy-build/-/raw/main/manifest.txt bash
 ```
+
+用 `CADDY_MANIFEST` 而不是 `CADDY_REL_BASE`：release 附件的地址形状各平台不一样，
+Gitee 是 `attach_files/{数字ID}/download/{文件名}`，数字 ID 只有上传完才知道，
+从 tag 根本推不出来。所以镜像流水线把 API 返回的**真实地址**写成一个
+`manifest.txt` 推进仓库，安装脚本查表即可。这套做法对任何平台都成立，
+以后接新平台不用改安装侧。
+
+清单只描述**最新一版**。要从镜像装指定旧版本，`install.sh` 会明确报错而不是
+装错版本 —— 回退请走 GitHub 源。
+
+> 仓库名来自仓库变量 `GITEE_REPO` / `CNB_REPO`，上面写的 `ivanabc/caddy-build`
+> 只是当前的值。
 
 两边的配额差两个数量级，保留策略因此不同：
 
@@ -140,6 +157,15 @@ export GITEE_TOKEN=xxx CNB_TOKEN=yyy          # 别写进命令行，会留在 h
 /tmp/bench-mirror.sh cnb   ivanabc/caddy-build "$CNB_TOKEN"
 ```
 
+测试 release 在退出时删除，**Ctrl-C / 被 kill / 中途报错也会删**。万一还是漏了
+（比如机器断电），扫一遍：
+
+```bash
+/tmp/bench-mirror.sh purge gitee ivanabc/caddy-build "$GITEE_TOKEN"
+```
+
+每个遗留的 `bench-*` 都带着 20MB 附件，会一直占着 Gitee 那 1 GB 的配额。
+
 传 20MB 随机数据（随机是为了防中间环节压缩把速率测虚），带实时进度，完事自动删掉
 测试 release。判断标准：
 
@@ -150,7 +176,7 @@ export GITEE_TOKEN=xxx CNB_TOKEN=yyy          # 别写进命令行，会留在 h
 | < 150 KB/s | 不可用，换机器 |
 
 可选环境变量：`SIZE_MB`（默认 20）、`INTERVAL`（进度间隔，默认 3）、`PROXY`（走代理测，
-`curl --proxy` 语法）、`BRANCH`、`KEEP=1`（保留测试 release 便于排查）。
+`curl --proxy` 语法）、`BRANCH`、`KEEP=1`（保留测试 release 便于排查，此时需自行删除）。
 
 ### 下载来源
 
@@ -160,6 +186,10 @@ export GITEE_TOKEN=xxx CNB_TOKEN=yyy          # 别写进命令行，会留在 h
 | :--- | :--- | ---: | :--- |
 | `RAW_BASE` | `install.sh`、`dist/*` | 几十 KB | GitHub raw / jsDelivr / 自建 Worker / R2 |
 | `REL_BASE` | 二进制 + `.sha256` | 约 69 MB | GitHub Releases / 前缀型代理 / R2 |
+
+`REL_BASE` 假设资产地址能按 `基址/tag/文件名` 拼出来。**这个假设只对 GitHub 式
+的平台成立。** 拼不出来的平台（Gitee）改用 `CADDY_MANIFEST` 指向一个
+`文件名 → 真实地址` 的清单，它同时覆盖 `REL_BASE` 和版本解析。
 
 **jsDelivr 拿不了二进制。** 它的 `/gh/` 单文件上限 20 MB，超了返回 403；而且
 `/gh/owner/repo@ref/path` 走的是 git 树，压根不经过 Releases。所以
@@ -184,9 +214,16 @@ curl -fsSL <install.sh> | sudo \
   CADDY_REL_BASE=https://dl.example.com/caddy-build \
   CADDY_TAG_FILE=https://dl.example.com/caddy-build/latest.txt bash
 
+# 地址推不出来的平台（Gitee 等）：用清单
+curl -fsSL <install.sh> | sudo \
+  CADDY_RAW_BASE=https://gitee.com/<owner>/<repo>/raw/master \
+  CADDY_MANIFEST=https://gitee.com/<owner>/<repo>/raw/master/manifest.txt bash
+
 # 连版本解析都走不通时，直接指定
 sudo CADDY_TAG=v2.11.4-20260807.1930 caddy-update
 ```
+
+仓库文件默认取 `main` 分支，可用 `CADDY_REF=` 改（自建镜像分支名不同时用得上）。
 
 `CADDY_RAW_BASE` 的形状是「基址 + `/仓库内相对路径`」，与
 `raw.githubusercontent.com/<owner>/<repo>/<ref>` 完全同构，所以 Worker 那种
@@ -387,17 +424,24 @@ plugins.txt
     │     试编译一次（不过就不提交）
     │     提交 go.mod / go.sum / main.go  ← 用 PAT，否则不触发下游 workflow
     │
-    └─ Build Custom Caddy (go.mod / go.sum / main.go 变更时触发)
+    └─ Build Custom Caddy (go.mod / go.sum 变更时触发)
           go mod verify           ← 不跑 tidy，-mod=readonly 保证可复现
           go build × {amd64, arm64}
-          冒烟测试：version 注入是否生效、模块数是否合理
+          冒烟测试：caddy version 是否与上游一致、模块数是否合理
           对比上一个 Release 的 go_modules.json 生成变更日志
-          发 Release
+          发 Release → 清理旧 Release
+             └─ Mirror → Gitee / CNB / R2（各自没配就跳过，不报错）
 ```
 
-版本号形如 `v20260807-1610`（Asia/Shanghai），由 `init` job 统一生成，两个架构共用同一个 tag。
+只看 `go.mod` / `go.sum` 而不看 `main.go`：`main.go` 的任何实质变更都必然伴随这两者变化，
+单独改 `main.go`（比如 `plugins.txt` 只调了顺序）产出的二进制是一样的，不值得重建。
 
-编译参数与 Caddy 官方一致：`-trimpath -ldflags "-w -s" -tags nobadger,nomysql,nopgx`（排除 BadgerDB / MySQL / PostgreSQL 存储后端以缩小体积），并额外注入 `CustomVersion`。`main.go` 里 import 了 `time/tzdata`，所以在没有系统时区库的精简环境下 `@` 时间匹配器一样能用。
+每个 workflow 的详细职责、触发条件和所需 Secret 见
+[`.github/workflows/README.md`](.github/workflows/README.md)。
+
+版本号形如 `v2.11.4-20260807.1930`（Asia/Shanghai），由 `init` job 统一生成，两个架构共用同一个 tag。
+
+编译参数与 Caddy 官方一致：`-trimpath -ldflags "-w -s" -tags nobadger,nomysql,nopgx`（排除 BadgerDB / MySQL / PostgreSQL 存储后端以缩小体积）。**刻意不注入 `CustomVersion`** —— 理由见下面「版本号」一节。`main.go` 里 import 了 `time/tzdata`，所以在没有系统时区库的精简环境下 `@` 时间匹配器一样能用。
 
 ### 仓库结构
 
@@ -411,19 +455,25 @@ dist/index.html                    → /usr/share/caddy/index.html
 dist/UPSTREAM.md                   同步来源与上游 commit 记录
 
 mirror/README.md                   镜像仓库用的精简 README 模板
-                                   （占位符由 mirror_cn.yml 按平台替换）
+                                   （占位符由 mirror.yml 按平台替换）
 
 scripts/install.sh                 安装 / 更新 / 卸载
 scripts/release_notes.py           Release 正文生成
+scripts/mirror-lib.sh              分发流程（平台无关），被 mirror.yml source
+scripts/ci-lib.sh                  CI 共用小工具（目前只有网络重试）
 scripts/bench-mirror.sh            镜像链路测速，选中转机用（不参与流水线）
 
+.github/workflows/README.md        ★ 各 workflow 的职责与配置总览
 .github/workflows/update_deps.yml  依赖解析
 .github/workflows/build.yml        编译与发布
 .github/workflows/sync_dist.yml    从 caddyserver/dist 同步打包资产
-.github/workflows/mirror_cn.yml    同步到 Gitee / CNB
+.github/workflows/mirror.yml       分发到 Gitee / CNB / R2（由 build.yml 调用）
 .github/dependabot.yml             Actions 版本自动跟进（不管 Go 依赖）
 .gitattributes                     强制 LF，防 CRLF 混入 plugins.txt
 ```
+
+加一个分发平台 = 在 `mirror.yml` 里复制一个 step、实现 6 个 `platform_*` 函数，
+`mirror-lib.sh` 一行都不用改。适配器契约写在 `mirror-lib.sh` 顶部。
 
 `scripts/bench-mirror.sh` 是运维工具不是流水线的一环 —— 放在仓库里是为了版本化管理、
 随手 `scp` 到候选机器上就能跑，本身不被任何 workflow 引用。
@@ -445,6 +495,12 @@ curl -fsSL .../install.sh | sudo WELCOME=0 bash
 ```
 
 此时 Caddyfile 仍然用官方那份，只是不放 `index.html`，根路径返回 404。
+
+`/usr/share/caddy/` 同时是默认站点根目录，所以 `install.sh` 会记一份欢迎页的
+sha256 到 `/etc/caddy/.welcome-sha256`：指纹对得上说明这页是脚本自己写的、
+可以覆盖；对不上（你换成了自己的内容）就保留不动并提示 —— 与 Caddyfile
+「已有一律不动」的处理保持一致。想换回官方欢迎页，删掉 `index.html` 再
+`caddy-update` 即可。
 
 ### 关于默认页与「指纹」
 
@@ -539,6 +595,10 @@ release 标识走 `.build-version` —— 三个问题三个答案，不互相�
 第二层其实更严格 —— 它能发现二进制被手动替换或损坏，而不只是标签对不上。
 回滚发生时状态文件会被删除，避免谎报版本。
 
+镜像端也有对应的一层：重跑 `mirror.yml` 时会先核对目标版本的资产
+（文件名 / 字节数 / `.sha256` 内容），齐全就跳过上传，不齐才删掉重传 ——
+不会每次都白传 140 MB。
+
 ```bash
 $ sudo caddy-update status
 仓库           ivanphz/caddy-build
@@ -579,8 +639,24 @@ Variables 里加一个 `KEEP_RELEASES`，脚本内置下限为 3。
 | `GITEE_RELAY_KEY` | 否 | 中转机 SSH 私钥 |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | 否 | R2 镜像用 |
 
-对应的 Variables：`GITEE_REPO`、`CNB_REPO`、`GITEE_RELAY_HOST` 等，见各自章节。
-**任一镜像的 token 没配，对应的镜像任务整个跳过**，不影响主流程。
+Variables：
+
+| 名称 | 默认 | 用途 |
+| :--- | :--- | :--- |
+| `KEEP_RELEASES` | 12 | GitHub 保留数，脚本内置下限 3 |
+| `MIN_MODULES` | 100 | 冒烟测试的模块数下限 |
+| `GITEE_REPO` / `CNB_REPO` | — | 镜像仓库，形如 `owner/repo` |
+| `GITEE_BRANCH` / `CNB_BRANCH` | 自动探测 | 探测不到会**报错停下**，不再猜 `main` |
+| `GITEE_USER` | 取 `GITEE_REPO` 的 owner | 仓库属于组织时 owner ≠ 登录名，需显式设 |
+| `GITEE_KEEP` / `CNB_KEEP` | 5 / 12 | 镜像端保留数 |
+| `GITEE_ASSETS` / `CNB_ASSETS` | 全部 | 只镜像部分资产时用 |
+| `GITEE_RELAY_HOST` / `_USER` / `_PORT` / `_KNOWN_HOSTS` | — | SSH 中转；不设 HOST 就直连 |
+| `R2_BUCKET` / `R2_ACCOUNT_ID` / `R2_PREFIX` | — | 不设 `R2_ACCESS_KEY_ID` 则 R2 步骤整个跳过 |
+| `R2_PUBLIC_BASE` | — | R2 公开域名，**可不配**：不配则只上传产物，不生成清单、不回显地址。建议放 Secrets——公开仓库的 Actions 日志会明文打印 `vars.*` |
+
+**缺配置一律跳过、不报错**；配了却用不了（token 无效、上传失败）才会标红。
+详见 [`.github/workflows/README.md`](.github/workflows/README.md) 的「容错约定」
+与「什么会出现在公开日志里」。
 
 ---
 

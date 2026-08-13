@@ -13,6 +13,9 @@
   plugins.txt           插件清单
 环境变量：
   CUSTOM_VERSION / BUILD_TIME / GO_VERSION
+  PREV_SOURCE   对比基准的来源: ok(拿到了) / none(首次发布) / failed(有但没取到)
+                旧版一律把「拿不到」当成空数组，于是一次网络抖动就会让变更日志
+                把全部插件列成 Added、并吞掉 Caddy Core 升级那一行，正文却毫无提示。
 输出：
   final_note.md
 """
@@ -94,8 +97,18 @@ def to_beijing(iso, fmt="%Y-%m-%d %H:%M:%S"):
         return "N/A"
 
 
-def build_changes(current, previous):
+def build_changes(current, previous, prev_source="ok"):
     """只关心 plugins.txt 里声明的 + 直接依赖，间接依赖噪音太大。"""
+    # 没有基准时，逐项对比的结果是没有意义的 —— 说清楚，不要拿一份看着正常的
+    # 「全部新增」糊弄过去。
+    if prev_source == "none":
+        return ["- 首个 Release，没有可对比的上一版。"]
+    if prev_source == "failed":
+        return [
+            "- ⚠️ **未能取得上一个 Release 的 `go_modules.json`**，本次无法生成变更对比。",
+            "- 完整依赖快照见本 Release 附带的 `go_modules.json`，或用 `caddy build-info` 查看。",
+        ]
+
     lines = []
 
     # 内核升级往往才是重新构建的真正原因，单独置顶
@@ -160,6 +173,13 @@ def main():
 
     core = current.get(CADDY_CORE, {})
     version = os.environ.get("CUSTOM_VERSION", "dev")
+    prev_source = os.environ.get("PREV_SOURCE", "ok")
+    if prev_source not in ("ok", "none", "failed"):
+        print(f"warn: 未知 PREV_SOURCE={prev_source!r}，按 ok 处理", file=sys.stderr)
+        prev_source = "ok"
+    # 基准文件存在但解析不出内容，等同于没取到
+    if prev_source == "ok" and not previous:
+        prev_source = "failed"
 
     out = [
         f"# {version}",
@@ -173,7 +193,7 @@ def main():
         f"- **Build Time**: {os.environ.get('BUILD_TIME', 'unknown')}",
         "",
         "### 📦 Plugin Changes",
-        *build_changes(current, previous),
+        *build_changes(current, previous, prev_source),
         "",
         "### 🔌 Installed Plugins Status",
         *build_table(current, tracked),

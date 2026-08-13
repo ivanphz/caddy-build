@@ -23,7 +23,8 @@
 #   caddy 二进制约 69 MB，所以 CADDY_SOURCE 只改仓库文件来源，不改二进制来源。
 #
 #   CADDY_REPO=owner/repo           指定其它仓库
-#   CADDY_TAG=v20260807-1610        安装指定版本，默认 latest
+#   CADDY_REF=main                  仓库文件取哪个分支/tag（默认 main）
+#   CADDY_TAG=v2.11.4-20260807.1930 安装指定版本，默认 latest
 #   CADDY_BIN=/usr/local/bin/caddy  二进制安装路径
 #   NO_SERVICE=1                    只装二进制，不碰 systemd
 #   WELCOME=0                       不部署默认欢迎页（Caddyfile 仍用官方那份，根路径返回 404）
@@ -31,10 +32,15 @@
 set -euo pipefail
 
 REPO="${CADDY_REPO:-ivanphz/caddy-build}"
+REF="${CADDY_REF:-main}"
 BIN_PATH="${CADDY_BIN:-/usr/local/bin/caddy}"
 GH_MIRROR="${GH_MIRROR:-}"
 TAG="${CADDY_TAG:-}"
 WELCOME="${WELCOME:-1}"
+
+# 前缀型代理必须以 / 结尾，否则会拼成 https://ghfast.tophttps://github.com/…
+# 让用户记住这个细节没有意义，这里统一补上。
+[ -z "$GH_MIRROR" ] || GH_MIRROR="${GH_MIRROR%/}/"
 
 CONF_DIR=/etc/caddy
 CONF_FILE="$CONF_DIR/Caddyfile"
@@ -42,6 +48,7 @@ DATA_DIR=/var/lib/caddy
 LOG_DIR=/var/log/caddy
 SITE_DIR=/usr/share/caddy
 STATE_FILE="$CONF_DIR/.build-version"   # 记录已安装的 release tag
+WELCOME_STATE="$CONF_DIR/.welcome-sha256"  # 记录本脚本上次写下的欢迎页指纹
 UNIT=/etc/systemd/system/caddy.service
 HELPER=/usr/local/bin/caddy-update
 
@@ -51,9 +58,9 @@ HELPER=/usr/local/bin/caddy-update
 #   REL_BASE  release 资产（二进制 + sha256），约 69 MB，只能走 GitHub 或前缀型代理
 #   TAG_URL   解析 latest tag 的 302 跳转，GitHub 特有
 case "${CADDY_SOURCE:-github}" in
-  github)   RAW_DEFAULT="${GH_MIRROR}https://raw.githubusercontent.com/${REPO}/main" ;;
-  jsdelivr) RAW_DEFAULT="https://cdn.jsdelivr.net/gh/${REPO}@main" ;;
-  fastly)   RAW_DEFAULT="https://fastly.jsdelivr.net/gh/${REPO}@main" ;;
+  github)   RAW_DEFAULT="${GH_MIRROR}https://raw.githubusercontent.com/${REPO}/${REF}" ;;
+  jsdelivr) RAW_DEFAULT="https://cdn.jsdelivr.net/gh/${REPO}@${REF}" ;;
+  fastly)   RAW_DEFAULT="https://fastly.jsdelivr.net/gh/${REPO}@${REF}" ;;
   *) echo "错误: 未知 CADDY_SOURCE '${CADDY_SOURCE}'（可用 github / jsdelivr / fastly）" >&2
      exit 1 ;;
 esac
@@ -122,11 +129,30 @@ manifest_get() {
 
 rel_url() {
   # $1 = 资产文件名。有清单就查表，否则按 基址/tag/文件名 拼。
+  # 注意：这个函数几乎总是在 $(...) 里被调用，所以它【不】die ——
+  # 子 shell 里 die 只杀得掉子 shell，主流程会带着一个空 URL 继续跑，
+  # 最后报一个跟真正原因毫不相干的错。校验统一放在 verify_manifest。
   if [ -n "$MANIFEST" ]; then
-    manifest_get "$1" || die "清单里没有资产 '$1'（$MANIFEST）"
+    manifest_get "$1" || printf ''
     return
   fi
   printf '%s/%s/%s' "$REL_BASE" "$TAG" "$1"
+}
+
+# 用清单时的一次性前置校验。放在主流程里（不在子 shell 里）才能真的 die。
+verify_manifest() {
+  local mtag arch asset a
+  [ -n "$MANIFEST" ] || return 0
+  mtag="$(manifest_get tag)" || die "清单里缺少 tag 行: $MANIFEST"
+  # 清单是「某一个版本」的地址表，不是全量索引。CADDY_TAG 指向别的版本时必须
+  # 停下来 —— 否则会出现「日志说在装 A、实际下载的是 B、状态文件记成 A」
+  # 这种最难查的静默错版。
+  [ "$mtag" = "$TAG" ] \
+    || die "清单当前指向 ${mtag}，提供不了 ${TAG}。镜像源只保存最新一版；要装指定版本请改用 GitHub 源，或去掉 CADDY_TAG。"
+  arch="$(detect_arch)"; asset="caddy-linux-${arch}"
+  for a in "$asset" "${asset}.sha256"; do
+    manifest_get "$a" >/dev/null || die "清单里没有资产 '${a}'（$MANIFEST）"
+  done
 }
 
 detect_arch() {
@@ -159,6 +185,13 @@ latest_tag() {
   # GitHub: 不依赖 jq / API 配额，跟一次 /releases/latest 的 302，从最终 URL 取 tag
   url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$TAG_URL")" \
     || die "无法解析最新版本（$TAG_URL）。可设 GH_MIRROR= / CADDY_TAG_URL= / CADDY_TAG_FILE=，或直接指定 CADDY_TAG="
+  # 代理/加速站有可能改写跳转，跳到一个不含 /tag/ 的页面。
+  # 不校验的话 ${url##*/tag/} 会把整条 URL 当成 tag 传下去，
+  # 最终表现为一个莫名其妙的 404，而不是「版本解析失败」。
+  case "$url" in
+    */tag/*) ;;
+    *) die "从 ${url} 解析不出 tag（代理可能改写了跳转）。可设 CADDY_TAG_FILE= 或直接指定 CADDY_TAG=" ;;
+  esac
   printf '%s' "${url##*/tag/}"
 }
 
@@ -266,6 +299,7 @@ install_welcome() {
   # 主动探测拿到它得不到任何判别力。反过来，任何自造的独特响应文本
   # （比如一句自定义 respond）都是完美的扫描特征 —— 所以这里没有
   # 「换一个更低调的占位页」这种选项，要么用官方那张，要么留空。
+  local page="${SITE_DIR}/index.html" have want
   mkdir -p "$SITE_DIR"
 
   if [ "$WELCOME" != 1 ]; then
@@ -274,12 +308,31 @@ install_welcome() {
     return 0
   fi
 
-  if curl -fsL --retry 2 -o "${SITE_DIR}/index.html.new" "$(raw_url dist/index.html)"; then
-    mv -f "${SITE_DIR}/index.html.new" "${SITE_DIR}/index.html"
-    chmod 0644 "${SITE_DIR}/index.html"
-    info "欢迎页: ${SITE_DIR}/index.html"
+  # ${SITE_DIR} 同时是默认站点根目录，用户完全可能把真实内容放在这里。
+  # 无条件覆盖 index.html 等于每次 caddy-update 都删一次人家的首页 ——
+  # write_default_config 对 Caddyfile 是「已有一律不动」，这里必须同样谨慎。
+  #
+  # 判据不能只看「文件存在」，否则本脚本自己写的页面就永远更新不了了。
+  # 记一份指纹：指纹对得上说明这页是我们写的、没人改过，可以覆盖；
+  # 对不上或没记录，就是用户的东西，只提示不动手。
+  if [ -f "$page" ]; then
+    have="$(sha256sum "$page" | awk '{print $1}')"
+    want="$( [ -r "$WELCOME_STATE" ] && head -n1 "$WELCOME_STATE" || printf '')"
+    if [ -z "$want" ] || [ "$have" != "$want" ]; then
+      c_ylw "  ! ${page} 不是本脚本写的（或已被修改），保留不动"
+      info "    想恢复官方欢迎页: sudo rm ${page} && sudo caddy-update"
+      return 0
+    fi
+  fi
+
+  if curl -fsL --retry 2 -o "${page}.new" "$(raw_url dist/index.html)"; then
+    mv -f "${page}.new" "$page"
+    chmod 0644 "$page"
+    sha256sum "$page" | awk '{print $1}' > "$WELCOME_STATE"
+    chmod 0644 "$WELCOME_STATE"
+    info "欢迎页: ${page}"
   else
-    rm -f "${SITE_DIR}/index.html.new"
+    rm -f "${page}.new"
     c_ylw "  ! 欢迎页下载失败，${SITE_DIR} 为空，根路径将返回 404"
   fi
   return 0
@@ -376,6 +429,8 @@ write_helper() {
 # 由 caddy-build install.sh 生成，勿手改（重装会覆盖）
 set -euo pipefail
 export CADDY_REPO="\${CADDY_REPO:-${REPO}}"
+export CADDY_REF="\${CADDY_REF:-${REF}}"
+export WELCOME="\${WELCOME:-${WELCOME}}"
 export CADDY_RAW_BASE="\${CADDY_RAW_BASE:-${RAW_BASE}}"
 export CADDY_REL_BASE="\${CADDY_REL_BASE:-${REL_BASE}}"
 export CADDY_TAG_URL="\${CADDY_TAG_URL:-${TAG_URL}}"
@@ -397,7 +452,15 @@ check_conflicts() {
   # PATH 上 /usr/local/bin 在前、/etc 下的 unit 覆盖 /lib 下的，所以平时是本构建生效。
   # 但 apt upgrade 会悄悄换掉 /usr/bin/caddy，一旦本地 unit 被删就会回落到无插件版本。
   command -v dpkg-query >/dev/null 2>&1 || return 0
-  dpkg-query -W -f='${Status}' caddy 2>/dev/null | grep -q "^install ok installed" || return 0
+  # 不用 `dpkg-query | grep -q`：grep -q 一匹配就关管道，上游收 SIGPIPE 退出非零，
+  # set -o pipefail 判定整条管道失败 —— 于是「装了官方包」反而走进 return 0，
+  # 该提示的冲突永远提示不出来。输出只有一行，先取回来再判。
+  local pkg_status
+  pkg_status="$(dpkg-query -W -f='${Status}' caddy 2>/dev/null || true)"
+  case "$pkg_status" in
+    'install ok installed') ;;
+    *) return 0 ;;
+  esac
   c_ylw "  ! 检测到已安装官方 caddy apt 包（/usr/bin/caddy）"
   info "    本构建装在 ${BIN_PATH}，正常情况下优先生效，但两者会长期打架。"
   info "    建议二选一:  sudo apt remove caddy    或    sudo apt-mark hold caddy"
@@ -408,6 +471,7 @@ do_install() {
   command -v curl >/dev/null || die "需要 curl"
   check_conflicts
   [ -n "$TAG" ] || TAG="$(latest_tag)"
+  verify_manifest
 
   local cur up_to_date=0
   cur="$(installed_tag)"
@@ -423,7 +487,7 @@ do_install() {
   fi
 
   if [ "$up_to_date" = 1 ]; then
-    printf '%s\n' "$(c_grn "已是最新版本 ${TAG}，无需更新。")"
+    c_grn "已是最新版本 ${TAG}，无需更新。"
     info "caddy version: $(caddy_version)"
     printf '%s\n' "$TAG" > "$STATE_FILE" 2>/dev/null || true
     info "强制重装: sudo CADDY_TAG=${TAG} caddy-update install --force"
@@ -445,7 +509,12 @@ do_install() {
   info "caddy version: $(caddy_version)"
   info "release tag:   $TAG  (记录于 $STATE_FILE)"
 
+  # helper 必须在 NO_SERVICE 分支之前写：不写的话，用 NO_SERVICE=1 装的机器
+  # 连 caddy-update 命令都没有，下次更新只能重新去记那一长串环境变量。
+  write_helper
+
   if [ "${NO_SERVICE:-0}" = 1 ]; then
+    rm -f "${BIN_PATH}.bak"
     c_grn "完成（已跳过 systemd 配置）"
     return 0
   fi
@@ -455,7 +524,6 @@ do_install() {
   install_welcome
   write_default_config
   write_unit
-  write_helper
 
   # 换二进制后新插件可能让旧配置失效，先验证再重启
   if ! "$BIN_PATH" validate --config "$CONF_FILE" >/dev/null 2>&1; then
@@ -503,7 +571,7 @@ do_uninstall() {
   need_root
   step "卸载"
   systemctl disable --now caddy 2>/dev/null || true
-  rm -f "$UNIT" "$BIN_PATH" "${BIN_PATH}.bak" "$HELPER" "$STATE_FILE"
+  rm -f "$UNIT" "$BIN_PATH" "${BIN_PATH}.bak" "$HELPER" "$STATE_FILE" "$WELCOME_STATE"
   systemctl daemon-reload 2>/dev/null || true
   c_grn "已移除二进制与服务。"
   info "配置和数据保留在 $CONF_DIR / $DATA_DIR / $SITE_DIR，确认不需要后手动删除。"
