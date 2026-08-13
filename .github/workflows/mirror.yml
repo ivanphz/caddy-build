@@ -1,0 +1,690 @@
+name: Mirror
+
+# 分发层：把 GitHub Release 的产物镜像到所有下游平台。
+# 目前是 Gitee、CNB（受限网络的下载路径）和 Cloudflare R2（自建 CDN）。
+#
+# 平台无关的流程（查重 → 校验 → 上传 → 写清单 → 推仓库 → 清理）全在
+# scripts/mirror-lib.sh 里，本文件只负责每个平台「怎么调 API」这一层。
+# 加一个平台 = 复制一个 step，实现 6 个 platform_* 函数，其余一行不用改。
+#
+# 三个平台共用同一套完整性判定：目标版本的资产齐全就跳过上传。
+# 以前 R2 每次无条件重传 140 MB，现在和 Gitee / CNB 一样先查后传。
+#
+# 刻意【不】同步的东西：
+#   - 源码（镜像仓库只需 README.md + scripts/install.sh + manifest.txt）
+#   - go_modules.json / main.go —— 这两个会完整列出全部插件
+#   - GitHub 那份 release notes —— 里面有插件版本表格
+#
+# 但要清楚一件事：二进制本身会暴露插件。Go 把依赖清单写在 buildinfo 段里，
+# `-ldflags "-w -s"` 剥不掉，`strings caddy | grep forwardproxy` 直接命中，
+# 不需要运行它。所以不同步清单只降低仓库页面的关键词可发现性，
+# 不降低产物被识别的概率 —— 这是两个不同的目标。
+#
+# Gitee 支持 SSH 中转（实测 runner 直传 <75 KB/s 且卡死，香港机器 3000 KB/s）：
+# 只有 72MB 的上传腿走中转机，建 release / 清理旧版本等控制面仍在 runner 上跑。
+# CNB 直连即可（runner 实测 366 KB/s），不需要中转。
+#
+# 由 build.yml 的 release job 之后自动调用；也可以 workflow_dispatch 单独重跑。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要镜像的 tag（留空 = 最新 release）'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  PROGRESS_INTERVAL: '15'   # 上传进度打印间隔（秒）
+  REPO_ROOT: ${{ github.workspace }}
+  DL_DIR: ${{ github.workspace }}/dl
+  BODY_FILE: ${{ github.workspace }}/body.md
+  GH_TAGS_FILE: ${{ github.workspace }}/gh_tags.txt
+  # 只镜像这四个。其余 release 资产（go_modules.json / main.go）留在 GitHub。
+  ASSETS: 'caddy-linux-amd64 caddy-linux-amd64.sha256 caddy-linux-arm64 caddy-linux-arm64.sha256'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # secrets 上下文在 step 的 if: 里不可用，只能先落到 job 级 env 再判 env.X。
+    # job 级 env 允许引用 secrets，step 级 if 允许引用 env，从这里绕过去。
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+      R2_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag & download assets
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          WANT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # gh_retry: runner 到 api.github.com 会偶发抖动（实测见过 x509
+          # "certificate is not valid for any names"，几秒就整步失败）。
+          source "${REPO_ROOT}/scripts/ci-lib.sh"
+
+          TAG="$WANT_TAG"
+          if [ -z "$TAG" ]; then
+            gh_retry /tmp/gh_latest.txt release list --limit 1 --json tagName --jq '.[0].tagName'
+            TAG="$(tr -d ' \r\n' < /tmp/gh_latest.txt)"
+          fi
+          [ -n "$TAG" ] || { echo "::error::找不到可镜像的 release"; exit 1; }
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "镜像目标: $TAG"
+
+          # 保留策略的基准：GitHub 上现存的 tag，按新到旧。
+          # 镜像端只做集合差，不依赖它自己的排序 —— CNB 的 id 是超 2^53 的雪花号，
+          # jq 的 sort_by 按 double 比较会排错，进而删错 release。
+          gh_retry "$GH_TAGS_FILE" release list --limit 500 --json tagName --jq '.[].tagName'
+          [ -s "$GH_TAGS_FILE" ] || { echo "::error::取不到 GitHub release 列表，保留策略无基准，中止"; exit 1; }
+          echo "GitHub 现存 release: $(wc -l < "$GH_TAGS_FILE") 个"
+
+          mkdir -p "$DL_DIR" && cd "$DL_DIR"
+          for a in $ASSETS; do
+            gh_retry /tmp/gh_dl.txt release download "$TAG" --pattern "$a" --clobber
+            [ -s "$a" ] || { echo "::error::下载到的 $a 是空文件"; exit 1; }
+            echo "  ✓ $a  ($(du -h "$a" | cut -f1))"
+          done
+
+          # 镜像用的 release 说明：只给校验和，不含任何插件信息
+          {
+            echo "Caddy build \`${TAG}\`"
+            echo ""
+            echo '```'
+            cat ./*.sha256
+            echo '```'
+          } > "$BODY_FILE"
+
+      # ==================================================================
+      # Gitee
+      # 配额硬约束：单附件 ≤100M，【每仓库总附件 ≤1G，含仓库附件和发行版附件】。
+      # 每个 release 约 139MB → 最多 7 个就撑满，所以保留数默认 5，比 GitHub 那边紧。
+      #
+      # 附件地址是 attach_files/{数字ID}/download/{文件名} —— 数字 ID 只有上传完
+      # 才知道，从 tag 推不出来。所以镜像完必须把真实地址写进 manifest.txt，
+      # 安装侧用 CADDY_MANIFEST 查表，不能照搬 GitHub 那种 基址/tag/文件名。
+      # ==================================================================
+      - name: Push to Gitee
+        # !cancelled() 而不是默认的 success()：两个镜像互相独立，
+        # 一边失败不该让另一边连试都不试。job 整体仍会标红。
+        # steps.resolve.outcome == 'success' 是必需的：!cancelled() 只表示「没被取消」，
+        # 前一步失败了它照样为真。少了这个条件，resolve 一失败这里就会带着未定义的
+        # TAG 往下跑，报一个跟真正原因毫不相干的 "TAG: unbound variable"。
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' && env.GITEE_TOKEN != '' }}
+        env:
+          TOKEN: ${{ secrets.GITEE_TOKEN }}
+          OWNER_REPO: ${{ vars.GITEE_REPO }}      # 例: ivanabc/caddy-build
+          # 留空 = 传全部。跨境上传 68MB 到 Gitee 实测走不通时，可以设成
+          # 只传校验和（例: "caddy-linux-amd64.sha256 caddy-linux-arm64.sha256"），
+          # 让 Gitee 只承担 install.sh + README 的分发。
+          ONLY: ${{ vars.GITEE_ASSETS }}
+          # ---- SSH 中转（留空 = 直连）----
+          # 主机名和主机公钥优先从 Secrets 读。
+          # GitHub 会把整个 env: 块原样打进日志，而本仓库是公开的 ——
+          # vars.* 明文可见，secrets.* 才会被替换成 ***。
+          # 放 Variables 也照常工作，只是主机名会公开。
+          RELAY_HOST: ${{ secrets.GITEE_RELAY_HOST || vars.GITEE_RELAY_HOST }}
+          RELAY_USER: ${{ vars.GITEE_RELAY_USER || 'root' }}
+          RELAY_PORT: ${{ vars.GITEE_RELAY_PORT || '22' }}
+          RELAY_KEY: ${{ secrets.GITEE_RELAY_KEY }}
+          RELAY_KNOWN_HOSTS: ${{ secrets.GITEE_RELAY_KNOWN_HOSTS || vars.GITEE_RELAY_KNOWN_HOSTS }}
+          GH_REPO_FULL: ${{ github.repository }}
+          # 留空则自动探测远端默认分支 —— Gitee 建仓默认是 master，不是 main。
+          # 写死分支名是上一版最主要的坑；现在探测不到会直接报错，不再猜 main。
+          # git 推送用户名默认从 OWNER_REPO 取斜杠前那段 —— 个人仓库的 owner
+          # 就是登录名。只有仓库属于「组织」时 owner ≠ 登录名，才需要设
+          # GITEE_USER 覆盖。刻意不叫 USER：那是 Unix 标准环境变量，
+          # 覆盖它等于给自己埋雷（不声明时它会是 runner，推送会静默用错用户名）。
+          GITEE_LOGIN: ${{ vars.GITEE_USER }}
+          BRANCH: ${{ vars.GITEE_BRANCH }}
+          KEEP: ${{ vars.GITEE_KEEP || 5 }}
+        run: |
+          set -euo pipefail
+          source "${REPO_ROOT}/scripts/ci-lib.sh"
+          skip_unless_configured Gitee GITEE_TOKEN "$TOKEN" GITEE_REPO "$OWNER_REPO"
+
+          LOGIN="${GITEE_LOGIN:-${OWNER_REPO%%/*}}"
+          API="https://gitee.com/api/v5/repos/${OWNER_REPO}"
+          HDR="Authorization: token ${TOKEN}"
+
+          PLATFORM_NAME='Gitee'
+          PLATFORM_REMOTE="https://${LOGIN}:${TOKEN}@gitee.com/${OWNER_REPO}.git"
+          PLATFORM_RAW_BASE="https://gitee.com/${OWNER_REPO}/raw/{BRANCH}"
+          PLATFORM_BRANCH_VAR='GITEE_BRANCH'
+          PLATFORM_DEFAULT_BRANCH='master'   # Gitee 建仓默认 master
+          WANT_ASSETS="${ONLY:-$ASSETS}"
+          echo "推送用户名: $LOGIN"
+
+          source "${REPO_ROOT}/scripts/mirror-lib.sh"
+
+          # ---------------- 适配器 ----------------
+
+          platform_release_find() {
+            curl -sS "${API}/releases/tags/$1" -H "$HDR" \
+              > "${MIRROR_TMPD}/release.json" 2>/dev/null || true
+            RELEASE_ID="$(jq -r '.id // empty' < "${MIRROR_TMPD}/release.json" 2>/dev/null || true)"
+          }
+
+          platform_release_assets() {
+            # 字段名在各平台间不统一，能取到哪个算哪个；三列都取不到就当没有，
+            # 上层会判定为不完整走「删了重传」—— 最坏情况等于旧版行为。
+            jq -r '
+              ( .assets // .attach_files // [] )[]
+              | ( .browser_download_url // .download_url // .url // "" ) as $u
+              | [ ( .name // ( $u | split("?")[0] | split("/") | last ) // "" ),
+                  $u,
+                  ( ( .size // "-" ) | tostring ) ]
+              | @tsv
+            ' < "${MIRROR_TMPD}/release.json" > "$REMOTE_ASSETS_FILE" 2>/dev/null \
+              || : > "$REMOTE_ASSETS_FILE"
+          }
+
+          platform_release_delete() {
+            local code
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -X DELETE "${API}/releases/$1" -H "$HDR")"
+            case "$code" in 2*) return 0 ;; *) echo "  DELETE 返回 HTTP ${code}"; return 1 ;; esac
+          }
+
+          platform_release_create() {
+            local resp
+            resp="$(curl -sS -X POST "${API}/releases" -H "$HDR" \
+                    -H 'Content-Type: application/json' \
+                    -d "$(jq -n --arg t "$1" --arg b "$(cat "$2")" --arg c "$3" \
+                          '{tag_name:$t, name:$t, body:$b, target_commitish:$c, prerelease:false}')")"
+            RELEASE_ID="$(printf '%s' "$resp" | jq -r '.id // empty')"
+            [ -n "$RELEASE_ID" ] \
+              || { echo "  服务端返回: $(printf '%s' "$resp" | head -c 500)"; return 1; }
+          }
+
+          platform_release_list() {
+            curl -sS "${API}/releases?page=1&per_page=100" -H "$HDR" \
+              | jq -r '.[] | [(.id|tostring), .tag_name] | @tsv' > "$RELEASE_LIST_FILE"
+          }
+
+          gitee_upload_direct() {
+            local rid="$1"; shift
+            local a stat http secs spd url
+            for a in "$@"; do
+              echo "  上传 ${a} ($(du -h "${DL_DIR}/${a}" | cut -f1)) …"
+              # 响应体写文件、变量只接 -w 的统计 —— 混在一起会让 jq 解析完 JSON
+              # 之后撞上统计文本而报错，把一次成功的上传误判成失败。
+              progress_start
+              stat="$(curl -S --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                      --max-time 1800 --retry 2 --retry-delay 5 \
+                      -o "${MIRROR_TMPD}/upload.json" \
+                      -w '%{http_code}|%{time_total}|%{speed_upload}' \
+                      -X POST "${API}/releases/${rid}/attach_files" -H "$HDR" \
+                      -F "file=@${DL_DIR}/${a}" 2>"$PROG_ERRF")" || {
+                        progress_stop
+                        echo "  上传 ${a} 超时或中断: $(progress_tail)"
+                        return 1; }
+              progress_stop
+              IFS='|' read -r http secs spd <<< "$stat"
+              printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$http" "$secs" \
+                     "$(awk -v s="$spd" 'BEGIN{printf "%.0f", s/1024}')"
+              url="$(jq -r '.browser_download_url // .download_url // empty' \
+                     "${MIRROR_TMPD}/upload.json" 2>/dev/null || true)"
+              [ -n "$url" ] || {
+                echo "  上传 ${a} 失败 (HTTP $http): $(head -c 400 "${MIRROR_TMPD}/upload.json")"
+                return 1; }
+              printf '%s\t%s\n' "$a" "$url" >> "$ASSET_URL_FILE"
+              echo "  ✓ ${a}"
+            done
+          }
+
+          # ============================================================
+          # SSH 中转上传
+          # runner 只发几 KB 的指令，72MB 由中转机直接从 GitHub 拉再传 Gitee。
+          # 三条「不残留」保证：
+          #   1) 远端全部工作放在 mktemp -d，trap 覆盖 EXIT/HUP/INT/TERM，
+          #      连 SSH 断线（SIGHUP）也会清理
+          #   2) 脚本经 stdin 喂给 bash -s，不落远端磁盘
+          #   3) token 不进命令行（ps 可见），写成 curl 配置文件放在临时目录
+          # 上传结果通过 stdout 的 __ASSET__ 标记行回传给 runner 写清单。
+          # ============================================================
+          gitee_upload_relay() {
+            local rid="$1"; shift
+            local names="$*"
+            local keyf kh relay log
+            echo "  经 ${RELAY_USER}@${RELAY_HOST} 中转"
+
+            keyf="$(mktemp -p "$MIRROR_TMPD")"; printf '%s\n' "$RELAY_KEY" > "$keyf"; chmod 600 "$keyf"
+            kh="$(mktemp -p "$MIRROR_TMPD")"
+            local -a sshopt=(-i "$keyf" -p "$RELAY_PORT" -o BatchMode=yes -o ConnectTimeout=20
+                             -o ServerAliveInterval=30 -o ServerAliveCountMax=6
+                             -o UserKnownHostsFile="$kh")
+            if [ -n "$RELAY_KNOWN_HOSTS" ]; then
+              printf '%s\n' "$RELAY_KNOWN_HOSTS" > "$kh"
+              sshopt+=(-o StrictHostKeyChecking=yes)
+            else
+              ssh-keyscan -p "$RELAY_PORT" -H "$RELAY_HOST" > "$kh" 2>/dev/null || true
+              mwarn "未设置 GITEE_RELAY_KNOWN_HOSTS，已用 ssh-keyscan 接受主机指纹（存在中间人风险）。建议在中转机上跑 ssh-keyscan -p ${RELAY_PORT} <host> 并把输出填进该变量。"
+            fi
+
+            relay="$(mktemp -p "$MIRROR_TMPD")"
+            log="${MIRROR_TMPD}/relay.log"
+            {
+              # 参数用 printf %q 传，token 含任何特殊字符都能安全还原；
+              # 脚本体用带引号的 heredoc，不会在 runner 侧被展开。
+              printf 'TOKEN=%q\n'     "$TOKEN"
+              printf 'API=%q\n'       "$API"
+              printf 'RID=%q\n'       "$rid"
+              printf 'ASSETS=%q\n'    "$names"
+              printf 'GH_BASE=%q\n'   "https://github.com/${GH_REPO_FULL}/releases/download/${TAG}"
+              printf 'SHA_LINES=%q\n' "$(cat "${DL_DIR}"/*.sha256)"
+              printf 'INTERVAL=%q\n'  "${PROGRESS_INTERVAL:-15}"
+              cat <<'REMOTE'
+          set -euo pipefail
+          command -v curl >/dev/null || { echo "远端缺少 curl"; exit 1; }
+          umask 077
+          WORK="$(mktemp -d)"
+          # 覆盖 HUP：SSH 连接断开时远端进程收到的就是 SIGHUP
+          trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+          cd "$WORK"
+
+          echo "    中转机 $(uname -n) $(uname -m)   工作目录 $WORK"
+          AVAIL="$(df -Pm . | awk 'NR==2{print $4}')"
+          [ "${AVAIL:-0}" -ge 300 ] || { echo "远端可用空间不足 300MB (${AVAIL}MB)"; exit 1; }
+
+          # token 走 curl 配置文件，不进命令行 —— 否则整个上传期间
+          # 任何用户 ps 一下就能看到它
+          printf 'header = "Authorization: token %s"\n' "$TOKEN" > cfg
+          printf '%s\n' "$SHA_LINES" > SHA256SUMS
+
+          progress_watch() {
+            local last="" line
+            while :; do
+              sleep "$INTERVAL"
+              [ -s "$1" ] || continue
+              line="$(tr '\r' '\n' < "$1" | awk 'NF>=12 && $1 ~ /^[0-9]+$/' | tail -n1)"
+              { [ -z "$line" ] || [ "$line" = "$last" ]; } && continue
+              last="$line"
+              printf '%s\n' "$line" \
+                | awk '{printf "      %s%%  %s/%s   当前 %s/s   剩余 %s\n", $5, $6, $2, $12, $11}'
+            done
+          }
+          PE=""; PP=""
+          pstart() { PE="$(mktemp -p "$WORK")"; progress_watch "$PE" & PP=$!; }
+          pstop()  { [ -n "$PP" ] && kill "$PP" 2>/dev/null || true
+                     [ -n "$PP" ] && wait "$PP" 2>/dev/null || true; PP=""; }
+          ptail()  { [ -s "$PE" ] && tr '\r' '\n' < "$PE" | grep -v '^[[:space:]]*$' | tail -2 || true; }
+
+          for a in $ASSETS; do
+            echo "    ↓ GitHub → 中转机: $a"
+            pstart
+            curl -S -fL --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+               --retry 3 --retry-delay 3 --max-time 1800 \
+                 -o "$a" "${GH_BASE}/${a}" 2>"$PE" || { pstop; echo "下载失败 $a: $(ptail)"; exit 1; }
+            pstop
+          done
+
+          # 校验和来自 runner 上已下载的那份，等于做了一次端到端一致性检查
+          sha256sum -c --ignore-missing SHA256SUMS \
+            || { echo "SHA256 校验失败，中止（不上传可疑文件）"; exit 1; }
+          echo "    ✓ SHA256 校验通过"
+
+          for a in $ASSETS; do
+            echo "    ↑ 中转机 → Gitee: $a ($(du -h "$a" | cut -f1))"
+            pstart
+            STAT="$(curl -S -K cfg --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                    --max-time 1800 --retry 2 --retry-delay 5 \
+                    -o resp.json -w '%{http_code}|%{time_total}|%{speed_upload}' \
+                    -X POST "${API}/releases/${RID}/attach_files" \
+                    -F "file=@${a}" 2>"$PE")" || { pstop; echo "上传中断 $a: $(ptail)"; exit 1; }
+            pstop
+            IFS='|' read -r HTTP SECS SPD <<< "$STAT"
+            printf '      HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
+                   "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
+            # 不依赖远端有 jq：把 JSON 拆行后抠出 browser_download_url，
+            # 顺手把 \/ 还原成 /（部分服务端会转义正斜杠）
+            URL="$(tr ',' '\n' < resp.json \
+                   | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                   | sed 's|\\/|/|g' | head -n1)"
+            [ -n "$URL" ] \
+              || { echo "上传失败 $a (HTTP $HTTP): $(head -c 300 resp.json)"; exit 1; }
+            printf '__ASSET__\t%s\t%s\n' "$a" "$URL"
+            echo "      ✓ $a"
+          done
+          echo "    中转完成，临时目录将随本次会话一并清理"
+          REMOTE
+            } > "$relay"
+
+            # tee 保留实时输出，同时把 __ASSET__ 标记行留下来给清单用。
+            # pipefail 已开，ssh 非零会正确传播。
+            ssh "${sshopt[@]}" "${RELAY_USER}@${RELAY_HOST}" 'bash -s' < "$relay" | tee "$log"
+
+            awk -F'\t' '$1=="__ASSET__"{print $2"\t"$3}' "$log" >> "$ASSET_URL_FILE"
+          }
+
+          platform_upload_assets() {
+            if [ -n "$RELAY_HOST" ] && [ -n "$RELAY_KEY" ]; then
+              gitee_upload_relay "$@"
+            else
+              echo "  runner 直连"
+              gitee_upload_direct "$@"
+            fi
+          }
+
+          mirror_run
+
+      # ==================================================================
+      # CNB —— 三步预签名上传，不是 multipart POST：
+      #   1) POST .../asset-upload-url   拿 upload_url + verify_url
+      #   2) PUT  <upload_url>           流式发文件
+      #   3) POST .../asset-upload-confirmation/{upload_token}/{asset_path}?ttl=0
+      # ttl 必须显式传 0（0=永久，最大 180 天）。不传的话附件可能到期消失，
+      # 表现为几个月后某台机器更新时 404 —— 这类故障最难排查。
+      # ==================================================================
+      - name: Push to CNB
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' && env.CNB_TOKEN != '' }}
+        env:
+          TOKEN: ${{ secrets.CNB_TOKEN }}         # 需要 repo-release:rw 权限
+          OWNER_REPO: ${{ vars.CNB_REPO }}        # 例: ivanabc/caddy-build
+          ONLY: ${{ vars.CNB_ASSETS }}            # 留空 = 传全部
+          BRANCH: ${{ vars.CNB_BRANCH }}          # 留空则自动探测远端默认分支
+          KEEP: ${{ vars.CNB_KEEP || 12 }}
+        run: |
+          set -euo pipefail
+          source "${REPO_ROOT}/scripts/ci-lib.sh"
+          skip_unless_configured CNB CNB_TOKEN "$TOKEN" CNB_REPO "$OWNER_REPO"
+
+          API="https://api.cnb.cool/${OWNER_REPO}/-/releases"
+          AUTH="Authorization: Bearer ${TOKEN}"
+          # 必须显式声明 Accept —— curl 默认发 */*，CNB 直接回 406。
+          # 它的错误文案提的是 content type，但 406 的语义是内容协商，坑在这。
+          # CNB 官方 CLI 发的是 application/vnd.cnb.api+json，application/json 同样接受。
+          ACC='Accept: application/json'
+
+          PLATFORM_NAME='CNB'
+          # CNB 的 git 认证：用户名固定 cnb，密码填访问令牌，不支持 SSH
+          PLATFORM_REMOTE="https://cnb:${TOKEN}@cnb.cool/${OWNER_REPO}.git"
+          PLATFORM_RAW_BASE="https://cnb.cool/${OWNER_REPO}/-/raw/{BRANCH}"
+          PLATFORM_BRANCH_VAR='CNB_BRANCH'
+          PLATFORM_DEFAULT_BRANCH='main'
+          WANT_ASSETS="${ONLY:-$ASSETS}"
+          CNB_REL_BASE="https://cnb.cool/${OWNER_REPO}/-/releases/download"
+
+          source "${REPO_ROOT}/scripts/mirror-lib.sh"
+
+          # ---------------- 适配器 ----------------
+
+          platform_release_find() {
+            curl -sS "${API}/tags/$1" -H "$AUTH" -H "$ACC" \
+              > "${MIRROR_TMPD}/release.json" 2>/dev/null || true
+            RELEASE_ID="$(jq -r '.id // empty' < "${MIRROR_TMPD}/release.json" 2>/dev/null || true)"
+          }
+
+          platform_release_assets() {
+            # CNB 的资产直链形状与 GitHub 同构，接口没给 url 时按 tag 拼一个兜底
+            jq -r --arg base "$CNB_REL_BASE" --arg tag "$TAG" '
+              ( .assets // .attach_files // [] )[]
+              | ( .name // .asset_name // "" ) as $n
+              | [ $n,
+                  ( .browser_download_url // .download_url // .url
+                    // ( if $n == "" then "" else $base + "/" + $tag + "/" + $n end ) ),
+                  ( ( .size // "-" ) | tostring ) ]
+              | @tsv
+            ' < "${MIRROR_TMPD}/release.json" > "$REMOTE_ASSETS_FILE" 2>/dev/null \
+              || : > "$REMOTE_ASSETS_FILE"
+          }
+
+          platform_release_delete() {
+            local code
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -X DELETE "${API}/$1" -H "$AUTH" -H "$ACC")"
+            case "$code" in 2*) return 0 ;; *) echo "  DELETE 返回 HTTP ${code}"; return 1 ;; esac
+          }
+
+          platform_release_create() {
+            local resp
+            resp="$(curl -sS -X POST "$API" -H "$AUTH" -H "$ACC" \
+                    -H 'Content-Type: application/json' \
+                    -d "$(jq -n --arg t "$1" --arg b "$(cat "$2")" --arg c "$3" \
+                          '{tag_name:$t, name:$t, body:$b, target_commitish:$c, make_latest:"true"}')")"
+            RELEASE_ID="$(printf '%s' "$resp" | jq -r '.id // empty')"
+            [ -n "$RELEASE_ID" ] \
+              || { echo "  服务端返回: $(printf '%s' "$resp" | head -c 500)"; return 1; }
+          }
+
+          platform_release_list() {
+            # 列表接口返回的是裸数组（schema: type=array），没有 items 包装。
+            # id 用 tostring 透传，jq 1.7 保留字面量，不会丢雪花号精度。
+            curl -sS "${API}?page=1&page_size=100" -H "$AUTH" -H "$ACC" \
+              | jq -r '.[] | [(.id|tostring), .tag_name] | @tsv' > "$RELEASE_LIST_FILE"
+          }
+
+          platform_upload_assets() {
+            local rid="$1"; shift
+            local a size u up vf stat http secs spd tail_ uptoken apath
+            for a in "$@"; do
+              size="$(stat -c%s "${DL_DIR}/${a}")"
+
+              u="$(curl -sS -X POST "${API}/${rid}/asset-upload-url" -H "$AUTH" -H "$ACC" \
+                   -H 'Content-Type: application/json' \
+                   -d "$(jq -n --arg n "$a" --argjson s "$size" \
+                         '{asset_name:$n, size:$s, overwrite:true, ttl:0}')")"
+              up="$(printf '%s' "$u" | jq -r '.upload_url // empty')"
+              vf="$(printf '%s' "$u" | jq -r '.verify_url // empty')"
+              [ -n "$up" ] && [ -n "$vf" ] \
+                || { echo "  取上传地址失败 ${a}: $(printf '%s' "$u" | head -c 400)"; return 1; }
+
+              echo "  上传 ${a} ($(du -h "${DL_DIR}/${a}" | cut -f1)) …"
+              # -o /dev/null：预签名存储的响应体没用，别刷屏。
+              # curl 不带 -f 时 4xx 也返回 0，所以必须自己查状态码。
+              progress_start
+              stat="$(curl -S --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                      --max-time 1800 --retry 2 --retry-delay 5 \
+                      -o /dev/null -w '%{http_code}|%{time_total}|%{speed_upload}' \
+                      -X PUT "$up" --upload-file "${DL_DIR}/${a}" 2>"$PROG_ERRF")" \
+                || { progress_stop; echo "  PUT 失败 ${a}: $(progress_tail)"; return 1; }
+              progress_stop
+              IFS='|' read -r http secs spd <<< "$stat"
+              printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$http" "$secs" \
+                     "$(awk -v s="$spd" 'BEGIN{printf "%.0f", s/1024}')"
+              case "$http" in 2*) ;; *) echo "  PUT ${a} 返回 HTTP $http"; return 1 ;; esac
+
+              # verify_url 形如 .../asset-upload-confirmation/{upload_token}/{asset_path}
+              tail_="${vf#*/asset-upload-confirmation/}"
+              uptoken="${tail_%%/*}"
+              apath="${tail_#*/}"
+              curl -sS -o /dev/null -X POST \
+                "${API}/${rid}/asset-upload-confirmation/${uptoken}/${apath}?ttl=0" \
+                -H "$AUTH" -H "$ACC" || { echo "  确认失败 ${a}"; return 1; }
+
+              printf '%s\t%s\n' "$a" "${CNB_REL_BASE}/${TAG}/${a}" >> "$ASSET_URL_FILE"
+              echo "  ✓ ${a}"
+            done
+          }
+
+          mirror_run
+
+      # ==================================================================
+      # Cloudflare R2
+      # 对象存储，没有 git 仓库也没有 release API：
+      #   PLATFORM_KIND=object  → 跳过分支探测和 git 推送
+      #   platform_sync_files   → 用 aws s3 cp 把仓库文件放到 <前缀>/<命名空间>/
+      #   platform_fetch_asset  → 校验用自己的 S3 凭据取，不要求存储桶公开可读
+      #
+      # 布局（PREFIX 默认 caddy）：
+      #   caddy/<tag>/caddy-linux-amd64        资产，按 tag 分目录
+      #   caddy/main/scripts/install.sh        仓库文件
+      #   caddy/main/manifest.txt
+      #   caddy/latest.txt                     最新 tag，给 CADDY_TAG_FILE 用
+      #
+      # R2 的地址能按 基址/tag/文件名 拼出来（和 GitHub 同形），所以除了清单，
+      # CADDY_REL_BASE + CADDY_TAG_FILE 的老办法也照样能用 —— 而且那条路能装
+      # 任意保留中的旧版本，清单只指向最新一版。
+      # ==================================================================
+      - name: Push to Cloudflare R2
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' && env.R2_KEY != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 不支持 aws-cli v2 默认开启的分块校验头，必须关掉
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          BUCKET: ${{ vars.R2_BUCKET }}
+          ACCOUNT: ${{ vars.R2_ACCOUNT_ID }}
+          PREFIX: ${{ vars.R2_PREFIX || 'caddy' }}
+          # 公开访问域名。这是 R2 这几个变量里【唯一】值得保密的一个：
+          # bucket 名和 account ID 泄露了也没用（走 S3 端点得有凭据），
+          # 但公开域名一旦进了公开仓库的日志，任何人都能直接下载。
+          # 放 Secrets 会被打码；不配也行，见下面的 PLATFORM_PUBLIC_URLS。
+          PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE || vars.R2_PUBLIC_BASE }}
+          ONLY: ${{ vars.R2_ASSETS }}
+          BRANCH: ${{ vars.R2_NAMESPACE }}
+          KEEP: ${{ vars.R2_KEEP || 12 }}
+        run: |
+          set -euo pipefail
+          source "${REPO_ROOT}/scripts/ci-lib.sh"
+          skip_unless_configured 'Cloudflare R2' \
+            R2_ACCESS_KEY_ID "${AWS_ACCESS_KEY_ID:-}" \
+            R2_SECRET_ACCESS_KEY "${AWS_SECRET_ACCESS_KEY:-}" \
+            R2_BUCKET "$BUCKET" \
+            R2_ACCOUNT_ID "$ACCOUNT"
+
+          # 公开域名是可选的。没有它就照常上传产物，只是不生成清单、
+          # 日志和摘要里也不回显任何地址 —— 想用自建 CDN 但不想让地址
+          # 公开挂在 Actions 日志里时，就这么配。
+          PUBLIC_BASE="${PUBLIC_BASE%/}"
+          if [ -n "$PUBLIC_BASE" ]; then
+            PLATFORM_PUBLIC_URLS=1
+          else
+            PLATFORM_PUBLIC_URLS=0
+            echo "::notice::R2 未配置 R2_PUBLIC_BASE，本次只上传产物，不生成清单、不回显地址。"
+          fi
+
+          ENDPOINT="https://${ACCOUNT}.r2.cloudflarestorage.com"
+          S3="s3://${BUCKET}/${PREFIX}"
+          AWS=(aws s3 --endpoint-url "$ENDPOINT")
+
+          PLATFORM_NAME='Cloudflare R2'
+          PLATFORM_KIND='object'
+          PLATFORM_DEFAULT_BRANCH='main'   # 仓库文件的路径命名空间，不是 git 分支
+          PLATFORM_BRANCH_VAR='R2_NAMESPACE'
+          # 无公开域名时用 s3:// 占位：完整性校验只需要它能唯一标识对象，
+          # 实际取文件走 platform_fetch_asset（S3 凭据），不碰这个地址。
+          URL_BASE="${PUBLIC_BASE:-s3://${BUCKET}}/${PREFIX}"
+          PLATFORM_RAW_BASE="${URL_BASE}/{BRANCH}"
+          WANT_ASSETS="${ONLY:-$ASSETS}"
+
+          source "${REPO_ROOT}/scripts/mirror-lib.sh"
+
+          # ---------------- 适配器 ----------------
+
+          platform_release_find() {
+            # 对象存储没有 release 实体，一个 tag 前缀存在就当它存在。
+            # id 就用 tag 本身，prune 那边照样对得上。
+            #
+            # 不要写成 `aws ls ... | grep -q .`：grep -q 一匹配就关掉管道，
+            # 上游收到 SIGPIPE 退出非零，set -o pipefail 于是判定整条管道失败，
+            # if 走进 else —— 结果是「前缀明明在，却永远说不存在」，
+            # 完整性检查形同虚设，每次照样重传 140MB。实测就是这么翻车的。
+            local out
+            out="$("${AWS[@]}" ls "${S3}/${1}/" 2>/dev/null || true)"
+            if [ -n "$out" ]; then RELEASE_ID="$1"; else RELEASE_ID=""; fi
+          }
+
+          platform_release_assets() {
+            # aws s3 ls 直接给字节数，比 HEAD 取 content-length 可靠
+            "${AWS[@]}" ls "${S3}/${1}/" 2>/dev/null \
+              | awk -v base="${URL_BASE}/${1}" \
+                    '$1!="PRE" && NF>=4 {printf "%s\t%s/%s\t%s\n", $4, base, $4, $3}' \
+              > "$REMOTE_ASSETS_FILE" || : > "$REMOTE_ASSETS_FILE"
+          }
+
+          platform_fetch_asset() {   # $1=名字 $2=url $3=落盘
+            "${AWS[@]}" cp "${S3}/${TAG}/${1}" "$3" --only-show-errors
+          }
+
+          platform_release_delete() {
+            "${AWS[@]}" rm --recursive "${S3}/${1}/" --only-show-errors
+          }
+
+          platform_release_create() { RELEASE_ID="$1"; }   # 前缀写进去就有了
+
+          platform_upload_assets() {
+            local tag="$1"; shift
+            local a
+            for a in "$@"; do
+              echo "  上传 ${a} ($(du -h "${DL_DIR}/${a}" | cut -f1)) …"
+              "${AWS[@]}" cp "${DL_DIR}/${a}" "${S3}/${tag}/${a}" --only-show-errors
+              printf '%s\t%s\n' "$a" "${URL_BASE}/${tag}/${a}" >> "$ASSET_URL_FILE"
+              echo "  ✓ ${a}"
+            done
+          }
+
+          platform_release_list() {
+            # 只列 tag 前缀，排掉仓库文件那个命名空间
+            "${AWS[@]}" ls "${S3}/" 2>/dev/null \
+              | awk -v ns="${MIRROR_BRANCH}/" '$1=="PRE" && $2!=ns {sub("/$","",$2); print $2"\t"$2}' \
+              > "$RELEASE_LIST_FILE" || : > "$RELEASE_LIST_FILE"
+          }
+
+          platform_sync_files() {   # $1=full|bootstrap（对象存储没有 bootstrap 的必要）
+            local ns="${MIRROR_BRANCH}" f
+            for f in scripts/install.sh; do
+              "${AWS[@]}" cp "${REPO_ROOT}/${f}" "${S3}/${ns}/${f}" --only-show-errors
+              echo "  ✓ ${ns}/${f}"
+            done
+            for f in dist/Caddyfile dist/index.html; do
+              [ -f "${REPO_ROOT}/${f}" ] || { mwarn "${PLATFORM_NAME}: 缺少 ${f}，跳过"; continue; }
+              "${AWS[@]}" cp "${REPO_ROOT}/${f}" "${S3}/${ns}/${f}" --only-show-errors
+              echo "  ✓ ${ns}/${f}"
+            done
+            [ "$1" = full ] || return 0
+
+            # latest.txt 不含任何域名，任何情况下都发：
+            # 它给 CADDY_TAG_FILE 用，配合 CADDY_REL_BASE 能装任意还保留着的旧版本，
+            # 而清单只指向最新一版。
+            printf '%s\n' "$TAG" > "${MIRROR_TMPD}/latest.txt"
+            "${AWS[@]}" cp "${MIRROR_TMPD}/latest.txt" "${S3}/latest.txt" --only-show-errors
+            echo "  ✓ latest.txt"
+
+            # 清单和 README 里都会写满绝对地址，没有公开域名就别生成 ——
+            # 生成一份指向 s3:// 的清单对安装脚本毫无用处，只会误导人。
+            if [ "${PLATFORM_PUBLIC_URLS:-1}" != 1 ]; then
+              echo "  （未配置公开域名，跳过 manifest.txt / README.md）"
+              return 0
+            fi
+            "${AWS[@]}" cp "$MANIFEST_LOCAL" "${S3}/${ns}/${MANIFEST_PATH}" --only-show-errors
+            render_readme > "${MIRROR_TMPD}/README.md"
+            "${AWS[@]}" cp "${MIRROR_TMPD}/README.md" "${S3}/${ns}/README.md" --only-show-errors
+            echo "  ✓ ${ns}/${MANIFEST_PATH} / ${ns}/README.md"
+          }
+
+          mirror_run
+
+          if [ "$PLATFORM_PUBLIC_URLS" = 1 ]; then
+            {
+              echo "R2 也可以按 tag 直接拼地址（能装任意保留中的旧版本）："
+              echo '```bash'
+              echo "curl -fsSL ${PUBLIC_BASE}/${PREFIX}/${MIRROR_BRANCH}/scripts/install.sh | sudo \\"
+              echo "  CADDY_RAW_BASE=${PUBLIC_BASE}/${PREFIX}/${MIRROR_BRANCH} \\"
+              echo "  CADDY_REL_BASE=${PUBLIC_BASE}/${PREFIX} \\"
+              echo "  CADDY_TAG_FILE=${PUBLIC_BASE}/${PREFIX}/latest.txt bash"
+              echo '```'
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
