@@ -644,12 +644,10 @@ jobs:
 
           platform_sync_files() {   # $1=full|bootstrap（对象存储没有 bootstrap 的必要）
             local ns="${MIRROR_BRANCH}" f
-            for f in scripts/install.sh; do
-              "${AWS[@]}" cp "${REPO_ROOT}/${f}" "${S3}/${ns}/${f}" --only-show-errors
-              echo "  ✓ ${ns}/${f}"
-            done
-            for f in dist/Caddyfile dist/index.html; do
-              [ -f "${REPO_ROOT}/${f}" ] || { mwarn "${PLATFORM_NAME}: 缺少 ${f}，跳过"; continue; }
+            # 文件清单来自 mirror-lib.sh 的 MIRROR_REPO_FILES，与 git 型平台共用一份
+            for f in $MIRROR_REPO_FILES; do
+              [ -f "${REPO_ROOT}/${f}" ] \
+                || { mwarn "${PLATFORM_NAME}: 本仓库没有 ${f}，跳过"; continue; }
               "${AWS[@]}" cp "${REPO_ROOT}/${f}" "${S3}/${ns}/${f}" --only-show-errors
               echo "  ✓ ${ns}/${f}"
             done
