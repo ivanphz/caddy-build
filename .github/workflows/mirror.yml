@@ -402,6 +402,12 @@ jobs:
           OWNER_REPO: ${{ vars.CNB_REPO }}        # 例: ivanabc/caddy-build
           ONLY: ${{ vars.CNB_ASSETS }}            # 留空 = 传全部
           BRANCH: ${{ vars.CNB_BRANCH }}          # 留空则自动探测远端默认分支
+          # 直接指定 raw 基址（{BRANCH} 会被替换）。留空则从候选里逐个探测。
+          # 在网页上打开仓库里任意文件、点「原始数据 / Raw」，把地址里
+          # 文件路径之前的那一段填进来即可。
+          RAW_BASE_OVERRIDE: ${{ vars.CNB_RAW_BASE }}
+          # 同上，指定 release 资产地址基址（不含 /{tag}/{文件名}）
+          REL_BASE_OVERRIDE: ${{ vars.CNB_REL_BASE }}
           KEEP: ${{ vars.CNB_KEEP || 12 }}
         run: |
           set -euo pipefail
@@ -418,15 +424,38 @@ jobs:
           PLATFORM_NAME='CNB'
           # CNB 的 git 认证：用户名固定 cnb，密码填访问令牌，不支持 SSH
           PLATFORM_REMOTE="https://cnb:${TOKEN}@cnb.cool/${OWNER_REPO}.git"
-          PLATFORM_RAW_BASE="https://cnb.cool/${OWNER_REPO}/-/raw/{BRANCH}"
+          # 实测确认：CNB 的原始内容在 /-/git/raw/，不是 GitLab 那种 /-/raw/。
+          # 网页上「复制路径 → 点击下载 / 通过 cURL 下载」给的就是这个形状；
+          # /-/blob/ 是文件页（HTML），/-/blob/{commit-sha}/ 是永久链接。
+          PLATFORM_RAW_BASE="${RAW_BASE_OVERRIDE:-https://cnb.cool/${OWNER_REPO}/-/git/raw/{BRANCH}}"
           PLATFORM_BRANCH_VAR='CNB_BRANCH'
           PLATFORM_DEFAULT_BRANCH='main'
           WANT_ASSETS="${ONLY:-$ASSETS}"
-          CNB_REL_BASE="https://cnb.cool/${OWNER_REPO}/-/releases/download"
+          # release 资产基址。这个形状还没实测确认过 —— 上传后 verify_asset_urls
+          # 会把 .sha256 拉回来逐字节比对，拼错了会当场报错并打出完整地址。
+          # 到时候把 CNB 发行版页面上任意资产的真实地址前缀填进 CNB_REL_BASE 即可。
+          CNB_REL_BASE="${REL_BASE_OVERRIDE:-https://cnb.cool/${OWNER_REPO}/-/releases/download}"
 
           source "${REPO_ROOT}/scripts/mirror-lib.sh"
 
           # ---------------- 适配器 ----------------
+
+          # 候选 raw 基址，第一个是实测确认可用的。留着后面几个是因为
+          # 平台改路径的事发生过（这个仓库就为此栽过一次）：真变了流水线会
+          # 自己找到新的并把 README 里的安装命令一起改掉，而不是静默推一份 404。
+          # 设了 CNB_RAW_BASE 就只用它 —— 但写死的值同样要过内容校验。
+          platform_raw_candidates() {
+            local br="$MIRROR_BRANCH"
+            if [ -n "$RAW_BASE_OVERRIDE" ]; then
+              printf '%s\n' "${RAW_BASE_OVERRIDE//\{BRANCH\}/$br}"
+              return 0
+            fi
+            cat <<CAND
+          https://cnb.cool/${OWNER_REPO}/-/git/raw/${br}
+          https://cnb.cool/${OWNER_REPO}/-/raw/${br}
+          https://api.cnb.cool/${OWNER_REPO}/-/git/raw/${br}
+          CAND
+          }
 
           platform_release_find() {
             curl -sS "${API}/tags/$1" -H "$AUTH" -H "$ACC" \

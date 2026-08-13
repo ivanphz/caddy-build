@@ -107,6 +107,8 @@
 | Secret | `CNB_TOKEN` | 否 | 需 `repo-release:rw`；不设则跳过 CNB |
 | Variable | `CNB_REPO` | CNB 必需 | 缺了 → 跳过 |
 | Variable | `CNB_BRANCH` / `CNB_ASSETS` / `CNB_KEEP` | 否 | 保留数默认 12 |
+| Variable | `CNB_RAW_BASE` | 否 | 直接指定 raw 基址（`{BRANCH}` 会被替换）。留空则从候选里逐个探测，默认第一个是实测确认的 `/-/git/raw/{BRANCH}` |
+| Variable | `CNB_REL_BASE` | 否 | 直接指定 release 资产基址（不含 `/{tag}/{文件名}`） |
 | Secret | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | 否 | 不设 `R2_ACCESS_KEY_ID` 则整个 R2 步骤跳过 |
 | Variable | `R2_BUCKET` / `R2_ACCOUNT_ID` | R2 必需 | 缺任一项 → 跳过 |
 | Secret 或 Variable | `R2_PUBLIC_BASE` | 否 | R2 公开访问域名。**不配也能用**：照常上传产物，只是不生成清单、日志和摘要里也不回显任何地址 |
@@ -127,6 +129,34 @@
 
 三个平台互相独立（`!cancelled()`），一个挂了另外两个照跑。但上游的
 `Resolve tag` 失败时三个都跳过 —— 没有 tag 就没什么可镜像的。
+
+### 软 404
+
+有平台对不存在的路径返回 **HTTP 200 + 一张 HTML 错误页**，而不是 404。
+`curl -f` 对此毫无办法，一整页 HTML 会被直接喂进 `bash`，报的是
+`syntax error near unexpected token '<'` —— 从错误信息完全看不出真正原因是
+地址形状写错了。CNB 实测就是这样。
+
+所以凡是校验地址可用性的地方都连内容一起验：
+
+| 文件 | 判据 |
+| :--- | :--- |
+| `scripts/install.sh` | 首行是 `#!` |
+| `manifest.txt` | 首行是 `tag<TAB>…` |
+| release 资产 | 把 `.sha256` 拉回来与本次构建逐字节比对 |
+
+`raw` 基址的路径形状没有跨平台标准，各家都不一样：
+
+| 平台 | 原始内容 | 文件页（HTML，**不能**当 raw 用） |
+| :--- | :--- | :--- |
+| GitHub | `raw.githubusercontent.com/{repo}/{ref}/` | `github.com/{repo}/blob/{ref}/` |
+| Gitee | `gitee.com/{repo}/raw/{分支}/`（302 到 `raw.giteeusercontent.com`） | `gitee.com/{repo}/blob/{分支}/` |
+| CNB | `cnb.cool/{repo}/-/git/raw/{分支}/` | `cnb.cool/{repo}/-/blob/{分支}/` |
+
+CNB 既不是 `/-/raw/`（GitLab 那套）也不是 `/blob/`，而且猜错时返回软 404。
+与其写死一个猜的值，`mirror.yml` 推完之后拿 `scripts/install.sh` 逐个试候选，
+选真正返回脚本的那个；全试不通就报错并列出每个候选的结果。
+知道正确答案时用 `CNB_RAW_BASE` 直接指定（**指定了也照样验**）。
 
 中转机同理：没配 `GITEE_RELAY_HOST` / `_KEY` 就自动回落 runner 直连，
 没配 `_KNOWN_HOSTS` 就 `ssh-keyscan` 并给出警告，都不会中断。
