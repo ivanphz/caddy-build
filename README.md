@@ -296,6 +296,11 @@ sudo CADDY_TAG=v2.11.4-20260807.1930 caddy-update
 
 仓库文件默认取 `main` 分支，可用 `CADDY_REF=` 改（自建镜像分支名不同时用得上）。
 
+`dist/Caddyfile` 和 `dist/index.html` 这两个小文件在主源取不到时会自动改用
+`CADDY_RAW_FALLBACK`（默认 jsDelivr），设成空串禁用。二进制不走这条路。
+取不到时会打出 HTTP 状态码 —— 404 是镜像没同步到，403 是平台拦了，000 是没连上，
+三种情况修法完全不同。
+
 `CADDY_RAW_BASE` 的形状是「基址 + `/仓库内相对路径`」，与
 `raw.githubusercontent.com/<owner>/<repo>/<ref>` 完全同构，所以 Worker 那种
 `https://<token>/<repo>/<ref>/<path>` 的路由开箱即用。
@@ -346,6 +351,47 @@ caddy build-info | grep vcs      # 这个二进制是哪个 commit 编的
 每次发布后把二进制、`.sha256`、`install.sh`、`dist/*` 和一个 `latest.txt` 版本指针
 推到 R2，然后**以 GitHub 上还存在的 release 为准**清理旧目录 —— 两边保留策略自动
 一致，也不用担心 tag 字典序排不对（`v2.9` vs `v2.11`）。
+
+### 镜像端排障
+
+镜像仓库里应该有这些：
+
+```bash
+B=https://gitee.com/ivanabc/caddy-build/raw/master   # 换成你的
+for f in scripts/install.sh dist/Caddyfile dist/index.html manifest.txt; do
+  printf '%-24s ' "$f"
+  curl -sSL -o /dev/null -w '%{http_code}  %{size_download} bytes\n' "$B/$f"
+done
+```
+
+四个都该是 `200` 且字节数非零。
+
+- 某个是 `404` → 先等几分钟再试（见下面的缓存说明）；一直 404 才是真没推上去，
+  看 workflow 日志里「已推送 README.md / …」那行列了哪些文件
+- 某个是 `403` → 平台拦了这类文件，把它从 `MIRROR_REPO_FILES` 去掉，
+  靠 `CADDY_RAW_FALLBACK` 兜底
+- 全是 `000` → 网络问题，与镜像无关
+
+**「git push 成功」不等于「raw 读得到」。** Gitee 公开仓库的 raw 数据在服务端有
+60~300 秒缓存（见响应头 `Cache-Control`）。刚被 404 过的路径，即使文件已经推上去，
+也可能继续返回一段时间的 404，而且**不同文件的缓存不是同时失效的** —— 会出现
+「同一次装机里 `dist/Caddyfile` 拿到了、`dist/index.html` 还是 404」这种现象。
+
+为此有三层防护，不用手动干预：
+
+1. `mirror.yml` 推完会**回读一遍**这几个文件，读不到就等 30 秒再试一轮，
+   仍然不行则在 workflow 里打警告
+2. `install.sh` 取不到时会打出 **HTTP 状态码**，而不是一句「下载失败」
+3. 主源取不到就自动改用 `CADDY_RAW_FALLBACK`（默认 jsDelivr），装机不会因此失败
+
+> `gitee.com/.../raw/...` 会 302 到 `raw.giteeusercontent.com` 的签名地址，
+> 手动 `curl` 一定要带 `-L`。
+
+`caddy-update` 在版本没变时会直接返回，**不会**重新去取 `dist/*`。只想补回欢迎页：
+
+```bash
+sudo caddy-update install --force
+```
 
 ### 镜像里放了什么，没放什么
 

@@ -381,6 +381,43 @@ git_sync_repo() {
   rm -rf "$work"
 }
 
+# 推完之后确认这些文件真的能从 RAW_BASE 读到。
+#
+# 「git push 成功」和「raw 读得到」是两件事：平台的 raw 有服务端缓存
+#（Gitee 文档写明公开仓库缓存 60~300 秒），刚覆盖的文件可能还在返回上一次的
+# 404。不在这里验证的话，这个问题要等几小时后某台机器装机时才暴露，
+# 而且现场只剩一句「下载失败」，回溯成本极高 —— 实测栽过一次。
+#
+# 只警告不报错：产物已经传好了，缓存过一会儿自己会好；真推丢了下一次也会再推。
+verify_repo_files() {
+  local f url code pending="" round
+  [ "${PLATFORM_PUBLIC_URLS:-1}" = 1 ] || return 0
+  mstep "${PLATFORM_NAME}: 校验仓库文件可读"
+
+  pending="$MIRROR_REPO_FILES $MANIFEST_PATH"
+  for round in 1 2; do
+    local still=""
+    for f in $pending; do
+      url="${RAW_BASE}/${f}"
+      code="$(curl -sSL -o /dev/null --connect-timeout 20 --max-time 60 \
+              -w '%{http_code}' "$url" 2>/dev/null || true)"
+      if [ "$code" = 200 ]; then
+        [ "$round" = 1 ] && mlog "✓ ${f}" || mlog "✓ ${f}（第二轮才读到，缓存刚刷新）"
+      else
+        still="${still} ${f}|${code}"
+      fi
+    done
+    pending=""
+    for f in $still; do pending="${pending} ${f%%|*}"; done
+    [ -n "$pending" ] || return 0
+    [ "$round" = 1 ] && { mlog "有 $(printf '%s' "$pending" | wc -w) 个还读不到，等 30 秒再试一轮"; sleep 30; }
+  done
+
+  for f in $still; do
+    mwarn "${PLATFORM_NAME}: ${RAW_BASE}/${f%%|*} 读不到 (HTTP ${f##*|})。产物已上传；若只是平台 raw 缓存没刷新，过几分钟自己会好，安装脚本也会自动回落备用源。持续如此说明这个文件根本没推上去，或被平台拦了。"
+  done
+}
+
 ensure_branch() {
   # 对象存储没有"分支要先存在"这回事，前缀写进去就有了
   [ "${PLATFORM_KIND:-git}" = git ] || return 0
@@ -487,6 +524,7 @@ mirror_run() {
   write_manifest
   MANIFEST_NOTE=" / ${MANIFEST_PATH}"
   sync_repo "$MIRROR_BRANCH" full
+  verify_repo_files
 
   mstep "${PLATFORM_NAME}: 清理旧版本（保留 GitHub 最新 ${KEEP} 个 tag）"
   prune_releases

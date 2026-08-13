@@ -24,6 +24,8 @@
 #
 #   CADDY_REPO=owner/repo           指定其它仓库
 #   CADDY_REF=main                  仓库文件取哪个分支/tag（默认 main）
+#   CADDY_RAW_FALLBACK=<url>        主源取不到 dist/* 时的备用源，
+#                                   默认 jsDelivr；设成空串禁用
 #   CADDY_TAG=v2.11.4-20260807.1930 安装指定版本，默认 latest
 #   CADDY_BIN=/usr/local/bin/caddy  二进制安装路径
 #   NO_SERVICE=1                    只装二进制，不碰 systemd
@@ -66,6 +68,11 @@ case "${CADDY_SOURCE:-github}" in
 esac
 
 RAW_BASE="${CADDY_RAW_BASE:-$RAW_DEFAULT}"
+
+# 主源取不到 dist/* 这类小文件时的备用来源（二进制不走这里）。
+# 用 ${VAR-默认} 而非 ${VAR:-默认}：显式设成空串就等于禁用。
+RAW_FALLBACK="${CADDY_RAW_FALLBACK-https://cdn.jsdelivr.net/gh/${REPO}@${REF}}"
+[ "$RAW_FALLBACK" = "$RAW_BASE" ] && RAW_FALLBACK=""
 REL_BASE="${CADDY_REL_BASE:-${GH_MIRROR}https://github.com/${REPO}/releases/download}"
 TAG_URL="${CADDY_TAG_URL:-${GH_MIRROR}https://github.com/${REPO}/releases/latest}"
 TAG_FILE="${CADDY_TAG_FILE:-}"   # 设了就优先用它，绕开 GitHub 的 302
@@ -100,6 +107,35 @@ need_root() {
 }
 
 raw_url() { printf '%s/%s' "$RAW_BASE" "$1"; }             # $1 = 仓库内相对路径
+
+# 取一个仓库文件（Caddyfile / 欢迎页这类小文件）。成功 0，失败非零。
+#
+# 失败时必须把 HTTP 状态码打出来。"下载失败"四个字什么都没说：
+#   404 → 镜像端没同步到这个文件
+#   403 → 平台拦了（有些平台不给 raw 出 HTML）
+#   000 → 根本没连上
+# 三种原因的修法完全不同，吞掉状态码等于逼人一轮轮猜。
+repo_fetch() {   # $1=仓库内相对路径 $2=落盘路径
+  local src url code errf rc
+  errf="$(mktemp)"
+  for src in "$RAW_BASE" "$RAW_FALLBACK"; do
+    [ -n "$src" ] || continue
+    url="${src}/$1"
+    rc=0
+    code="$(curl -fL --retry 2 --max-time 60 -sS -o "$2" -w '%{http_code}' "$url" 2>"$errf")" || rc=$?
+    if [ "$rc" = 0 ]; then
+      rm -f "$errf"
+      [ "$src" = "$RAW_BASE" ] || info "  （主源取不到，已改用备用源）"
+      return 0
+    fi
+    rm -f "$2"
+    c_ylw "  ! 取 $1 失败 (HTTP ${code:-000})"
+    info  "    $url"
+    [ -s "$errf" ] && info "    $(tr -d '\r' < "$errf" | tail -n1)"
+  done
+  rm -f "$errf"
+  return 1
+}
 
 # 清单格式（tab 分隔，每行 key<TAB>value）:
 #   tag                       v2.11.4-20260807.1930
@@ -325,7 +361,7 @@ install_welcome() {
     fi
   fi
 
-  if curl -fsL --retry 2 -o "${page}.new" "$(raw_url dist/index.html)"; then
+  if repo_fetch dist/index.html "${page}.new"; then
     mv -f "${page}.new" "$page"
     chmod 0644 "$page"
     sha256sum "$page" | awk '{print $1}' > "$WELCOME_STATE"
@@ -333,7 +369,8 @@ install_welcome() {
     info "欢迎页: ${page}"
   else
     rm -f "${page}.new"
-    c_ylw "  ! 欢迎页下载失败，${SITE_DIR} 为空，根路径将返回 404"
+    c_ylw "  ! 欢迎页取不到，${SITE_DIR} 为空，根路径将返回 404"
+    info  "    不影响使用；把自己的内容放进 ${SITE_DIR} 即可"
   fi
   return 0
 }
@@ -345,13 +382,13 @@ write_default_config() {
     return 0
   fi
 
-  if curl -fsL --retry 2 -o "${CONF_FILE}.new" "$(raw_url dist/Caddyfile)"; then
+  if repo_fetch dist/Caddyfile "${CONF_FILE}.new"; then
     mv -f "${CONF_FILE}.new" "$CONF_FILE"
   else
     # 兜底副本与 caddyserver/dist/config/Caddyfile 逐字节相同。
     # 刻意不在这里自造任何独特文案 —— 见 install_welcome 的注释。
     rm -f "${CONF_FILE}.new"
-    c_ylw "  ! Caddyfile 下载失败，写入内置副本"
+    c_ylw "  ! 改用内置副本（与上游逐字节相同）"
     sed 's/^    //' > "$CONF_FILE" <<'CADDYFILE_EOF'
     # The Caddyfile is an easy way to configure your Caddy web server.
     #
@@ -432,6 +469,7 @@ export CADDY_REPO="\${CADDY_REPO:-${REPO}}"
 export CADDY_REF="\${CADDY_REF:-${REF}}"
 export WELCOME="\${WELCOME:-${WELCOME}}"
 export CADDY_RAW_BASE="\${CADDY_RAW_BASE:-${RAW_BASE}}"
+export CADDY_RAW_FALLBACK="\${CADDY_RAW_FALLBACK-${RAW_FALLBACK}}"
 export CADDY_REL_BASE="\${CADDY_REL_BASE:-${REL_BASE}}"
 export CADDY_TAG_URL="\${CADDY_TAG_URL:-${TAG_URL}}"
 export CADDY_TAG_FILE="\${CADDY_TAG_FILE:-${TAG_FILE}}"
