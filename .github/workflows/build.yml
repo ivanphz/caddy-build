@@ -20,6 +20,9 @@ concurrency:
 
 env:
   TZ: Asia/Shanghai
+  # 冒烟测试的模块数下限。标准 Caddy 约 100 个，加 18 个插件后远超这个数；
+  # 明显偏少说明有插件没注册进去。加减插件时可用仓库变量 MIN_MODULES 调。
+  MIN_MODULES: ${{ vars.MIN_MODULES || 100 }}
 
 jobs:
   init:
@@ -161,8 +164,9 @@ jobs:
           # 模块 ID 冲突会让 caddy 在 init 阶段 panic，list-modules 是最早的探针
           echo "=== list-modules ==="
           COUNT="$("$BIN" list-modules --versions | wc -l)"
-          echo "已注册模块数: $COUNT"
-          [ "$COUNT" -gt 100 ] || { echo "::error::模块数异常偏少，可能有插件没注册进去"; exit 1; }
+          echo "已注册模块数: $COUNT (下限 ${MIN_MODULES})"
+          [ "$COUNT" -gt "$MIN_MODULES" ] \
+            || { echo "::error::模块数异常偏少，可能有插件没注册进去"; exit 1; }
 
           # 非标准模块（即插件提供的）清单，方便肉眼核对
           echo "=== non-standard modules ==="
@@ -178,13 +182,33 @@ jobs:
           CUSTOM_VERSION: ${{ needs.init.outputs.version_tag }}
           BUILD_TIME: ${{ needs.init.outputs.build_time }}
         run: |
+          set -euo pipefail
+          source scripts/ci-lib.sh
+
           go list -m -json all | jq -s '.' > go_modules.json
 
-          # 拉上一个 Release 的同名产物做对比；首次发布时不存在，回落到空数组
-          gh release download --pattern 'go_modules.json' --output prev_go_modules.json \
-            || echo '[]' > prev_go_modules.json
+          # 拉上一个 Release 的同名产物做对比。
+          #
+          # 这里必须区分两种「拿不到」，旧版一律回落成空数组是个静默降级：
+          # 一次网络抖动就会让 release notes 把全部 18 个插件列成 ✨ Added、
+          # 并且把真正的 Caddy Core 升级那一行整个吞掉 —— 正文看上去完全正常，
+          # 没有任何地方提示对比基准其实是空的。
+          if retry 4 5 -- gh release download \
+               --pattern 'go_modules.json' --output prev_go_modules.json --clobber; then
+            PREV_SOURCE=ok
+          elif gh_retry /tmp/rel_count.txt release list --limit 1 --json tagName --jq 'length' \
+               && [ "$(tr -d ' \r\n' < /tmp/rel_count.txt)" = "0" ]; then
+            PREV_SOURCE=none            # 首次发布，本来就没有基准
+            echo '[]' > prev_go_modules.json
+          else
+            PREV_SOURCE=failed          # 有上一个 release，但没取到
+            echo '[]' > prev_go_modules.json
+            echo "::warning::未能获取上一个 Release 的 go_modules.json，本次变更日志没有对比基准"
+          fi
+          echo "对比基准: ${PREV_SOURCE}"
 
-          GO_VERSION="$(go version | awk '{print $3}')" python3 scripts/release_notes.py
+          GO_VERSION="$(go version | awk '{print $3}')" \
+          PREV_SOURCE="$PREV_SOURCE" python3 scripts/release_notes.py
 
       - name: Generate Checksum
         run: sha256sum "${{ env.ASSET }}" > "${{ env.ASSET }}.sha256"
@@ -234,7 +258,7 @@ jobs:
             echo ""
             echo "### 📥 安装 / 更新"
             echo '```bash'
-            echo "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | sudo bash"
+            echo "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch || 'main' }}/scripts/install.sh | sudo bash"
             echo '```'
           } >> body.md
           cat body.md
@@ -258,7 +282,10 @@ jobs:
       # 「一键降级」：一年前的二进制带着一年份未修补的 CVE，却能被 CADDY_TAG=
       # 直接装回任何一台机器。保留数量可用仓库变量 KEEP_RELEASES 覆盖
       #（Settings → Secrets and variables → Actions → Variables）。
+      # 清理失败不该把一次成功的发布标红：产物已经发出去了，少删几个旧版本
+      # 下次构建会补上。真正需要红的是编译和发布，不是垃圾回收。
       - name: Prune old releases
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}   # 本 job 没有 checkout，gh 需要显式指定仓库
@@ -266,10 +293,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 这个 job 没有 checkout，ci-lib.sh 取不到，重试就地写一份小的
+          gh_retry() {
+            local out="$1"; shift
+            local i
+            for i in 1 2 3; do
+              gh "$@" > "$out" 2>/tmp/gh.err && return 0
+              echo "  gh 第 ${i}/3 次失败: $(tail -n1 /tmp/gh.err)" >&2
+              sleep $(( i * 5 ))
+            done
+            echo "::warning::gh 重试 3 次仍失败: gh $*"
+            return 1
+          }
+
           # 下限保护：无论变量填成什么，至少保留 3 个
           [ "$KEEP" -ge 3 ] 2>/dev/null || KEEP=3
 
-          TOTAL="$(gh release list --limit 500 --json tagName --jq 'length')"
+          gh_retry /tmp/total.txt release list --limit 500 --json tagName --jq 'length'
+          TOTAL="$(tr -d ' \r\n' < /tmp/total.txt)"
           echo "现有 release: ${TOTAL}，保留最近 ${KEEP} 个"
           if [ "$TOTAL" -le "$KEEP" ]; then
             echo "无需清理"
@@ -278,108 +319,20 @@ jobs:
 
           # 按创建时间倒序后跳过前 KEEP 个。刚创建的这一个必然排第一，不会被误删；
           # build.yml 的插件变更对比依赖 releases/latest 的 go_modules.json，必须保住。
-          gh release list --limit 500 --json tagName,createdAt \
-            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName" \
-          | while read -r tag; do
+          gh_retry /tmp/prune.txt release list --limit 500 --json tagName,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName"
+          while read -r tag; do
               [ -n "$tag" ] || continue
               echo "  删除 $tag"
-              gh release delete "$tag" --yes --cleanup-tag
-            done
+              gh release delete "$tag" --yes --cleanup-tag || echo "  ! $tag 删除失败"
+            done < /tmp/prune.txt
 
-          echo "剩余 release: $(gh release list --limit 500 --json tagName --jq 'length')"
-
-  # ================================================================
-  # 可选：把产物镜像到 Cloudflare R2，给受限网络提供第二条下载路径。
-  # 不设仓库变量 R2_BUCKET 就整个跳过，对默认使用者零影响。
-  #
-  # 为什么是 R2 而不是国内平台：本二进制编进了 forwardproxy(naive)/trojan，
-  # 推到需要实名认证的国内代码托管或对象存储上，风险不在技术层面。
-  #
-  # 需要配置（Settings → Secrets and variables → Actions）:
-  #   Variables: R2_BUCKET, R2_ACCOUNT_ID, R2_PREFIX(可选，默认 caddy-build)
-  #   Secrets:   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
-  # ================================================================
+  # 分发层。所有下游平台（Gitee / CNB / R2）都在 mirror.yml 里，
+  # 加平台只改那一个文件。任一平台的 token 没配，对应的 step 自己跳过；
+  # 整个 job 失败也不影响 GitHub 侧已经发出去的 release。
   mirror:
     needs: [init, release]
-    runs-on: ubuntu-latest
-    if: vars.R2_BUCKET != ''
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      AWS_REQUEST_CHECKSUM_CALCULATION: when_required   # R2 不认 aws-chunked 校验和
-      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-      ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-      BUCKET: ${{ vars.R2_BUCKET }}
-      PREFIX: ${{ vars.R2_PREFIX || 'caddy-build' }}
-      TAG: ${{ needs.init.outputs.version_tag }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Upload release assets
-        run: |
-          set -euo pipefail
-          for a in artifacts/caddy-amd64/* artifacts/caddy-arm64/*; do
-            aws s3 cp --endpoint-url "$ENDPOINT" --only-show-errors \
-              "$a" "s3://${BUCKET}/${PREFIX}/${TAG}/$(basename "$a")"
-            echo "  ✓ ${TAG}/$(basename "$a")"
-          done
-
-      - name: Upload repo files
-        run: |
-          set -euo pipefail
-          # install.sh 和 dist/* 也镜像一份，这样受限网络下整条安装链路都不碰 GitHub
-          for f in scripts/install.sh dist/Caddyfile dist/index.html; do
-            aws s3 cp --endpoint-url "$ENDPOINT" --only-show-errors \
-              "$f" "s3://${BUCKET}/${PREFIX}/main/${f}"
-            echo "  ✓ main/${f}"
-          done
-
-          # R2 没有 releases/latest 这种 302，用一个纯文本指针代替
-          printf '%s\n' "$TAG" > latest.txt
-          aws s3 cp --endpoint-url "$ENDPOINT" --only-show-errors \
-            --cache-control 'max-age=300' \
-            latest.txt "s3://${BUCKET}/${PREFIX}/latest.txt"
-          echo "  ✓ latest.txt -> $TAG"
-
-      - name: Prune R2 to match GitHub retention
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # 不自己算保留策略 —— 直接以 GitHub 上还存在的 release 为准，
-          # 两边永远一致，也不用担心 tag 的字典序排不对（v2.9 vs v2.11）。
-          gh release list --limit 500 --json tagName --jq '.[].tagName' | sort -u > keep.txt
-          echo "GitHub 现存 release: $(wc -l < keep.txt) 个"
-
-          aws s3 ls --endpoint-url "$ENDPOINT" "s3://${BUCKET}/${PREFIX}/" \
-            | awk '$1=="PRE"{print $2}' | tr -d '/' | grep -v '^main$' > have.txt || true
-
-          while read -r tag; do
-            [ -n "$tag" ] || continue
-            if ! grep -qxF "$tag" keep.txt; then
-              echo "  删除 R2 目录 $tag"
-              aws s3 rm --endpoint-url "$ENDPOINT" --recursive --only-show-errors \
-                "s3://${BUCKET}/${PREFIX}/${tag}/"
-            fi
-          done < have.txt
-
-      - name: Summary
-        run: |
-          {
-            echo "### R2 镜像"
-            echo ""
-            echo '```bash'
-            echo "curl -fsSL https://<你的R2域名>/${PREFIX}/main/scripts/install.sh | sudo \\"
-            echo "  CADDY_RAW_BASE=https://<你的R2域名>/${PREFIX}/main \\"
-            echo "  CADDY_REL_BASE=https://<你的R2域名>/${PREFIX} \\"
-            echo "  CADDY_TAG_FILE=https://<你的R2域名>/${PREFIX}/latest.txt bash"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+    uses: ./.github/workflows/mirror.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.init.outputs.version_tag }}
