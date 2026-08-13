@@ -130,6 +130,34 @@
 三个平台互相独立（`!cancelled()`），一个挂了另外两个照跑。但上游的
 `Resolve tag` 失败时三个都跳过 —— 没有 tag 就没什么可镜像的。
 
+### pipefail 与提前关闭读端的命令
+
+这个坑在本仓库踩过**两次**，两次都表现为「功能其实是好的，校验说它坏了」：
+
+```bash
+set -o pipefail
+printf '%s' "$body" | head -n1 | grep -q '^#!'   # grep 匹配成功
+echo $?                                          # → 141
+```
+
+`grep -q` 一匹配就退出 → `head` 收 EPIPE 退出 → `printf` 再写就吃 SIGPIPE(141)
+→ `pipefail` 取管道里最后一个非零状态，判整条失败。
+
+阴险的地方在于它**按数据量分化**：小文件一次写完就结束了，不触发；大文件才触发。
+实测现象是 510 字节的 `manifest.txt` 校验通过、24 KB 的 `install.sh` 报 soft404。
+
+同类写法还有 `aws s3 ls … | grep -q .`（前缀明明存在却判为不存在）、
+`curl … | head -n1`（内容取到了却走进 die）。
+
+**规则：`pipefail` 下不要把 `head` / `grep -q` / `sed …q` 这类会提前关闭读端的命令
+放在管道末尾。** 先整个取回变量，再用 bash 参数展开处理：
+
+```bash
+body="$(curl -sSL "$url")"
+first="${body%%$'\n'*}"
+case "$first" in '#!'*) ;; *) echo 不是脚本 ;; esac
+```
+
 ### 软 404
 
 有平台对不存在的路径返回 **HTTP 200 + 一张 HTML 错误页**，而不是 404。

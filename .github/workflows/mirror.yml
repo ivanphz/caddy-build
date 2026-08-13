@@ -357,9 +357,13 @@ jobs:
                    "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
             # 不依赖远端有 jq：把 JSON 拆行后抠出 browser_download_url，
             # 顺手把 \/ 还原成 /（部分服务端会转义正斜杠）
+            # 末尾不接 head -n1：它读到一行就关管道，上游 sed 收 SIGPIPE，
+            # set -o pipefail 会把整条管道判为失败 —— 而这是一句独立赋值，
+            # errexit 会直接终止中转脚本，上传到一半无声中断。改用参数展开切首行。
             URL="$(tr ',' '\n' < resp.json \
                    | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-                   | sed 's|\\/|/|g' | head -n1)"
+                   | sed 's|\\/|/|g')"
+            URL="${URL%%$'\n'*}"
             [ -n "$URL" ] \
               || { echo "上传失败 $a (HTTP $HTTP): $(head -c 300 resp.json)"; exit 1; }
             printf '__ASSET__\t%s\t%s\n' "$a" "$URL"
@@ -431,9 +435,9 @@ jobs:
           PLATFORM_BRANCH_VAR='CNB_BRANCH'
           PLATFORM_DEFAULT_BRANCH='main'
           WANT_ASSETS="${ONLY:-$ASSETS}"
-          # release 资产基址。这个形状还没实测确认过 —— 上传后 verify_asset_urls
-          # 会把 .sha256 拉回来逐字节比对，拼错了会当场报错并打出完整地址。
-          # 到时候把 CNB 发行版页面上任意资产的真实地址前缀填进 CNB_REL_BASE 即可。
+          # release 资产基址。实测确认可用（与 raw 不同，这个就是常规形状）。
+          # 上传后 verify_asset_urls 仍会把 .sha256 拉回来逐字节比对，
+          # 平台哪天改了会当场报错并打出完整地址，不必等到装机。
           CNB_REL_BASE="${REL_BASE_OVERRIDE:-https://cnb.cool/${OWNER_REPO}/-/releases/download}"
 
           source "${REPO_ROOT}/scripts/mirror-lib.sh"
