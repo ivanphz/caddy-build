@@ -42,6 +42,65 @@ sudo CADDY_TAG=v2.11.4-20260807.1930 caddy-update  # 装/回退到指定版本
 sudo NO_SERVICE=1 caddy-update              # 只更新二进制，不碰 systemd
 ```
 
+### 完整卸载
+
+`apt remove` 删不掉它 —— 二进制在 `/usr/local/bin/caddy`，不是 .deb 包。
+
+**第一步：停服务、删程序**
+
+```bash
+sudo caddy-update uninstall
+```
+
+移除 `/usr/local/bin/caddy`、`/usr/local/bin/caddy-update`、systemd unit 和版本状态文件。
+**配置、证书、站点内容一概不动** —— 卸载重装不会丢证书。
+
+`caddy-update` 已经不在了（手动删过、或当初用 `NO_SERVICE=1` 装的旧版本）就手工来：
+
+```bash
+sudo systemctl disable --now caddy
+sudo rm -f /etc/systemd/system/caddy.service
+sudo rm -f /usr/local/bin/caddy /usr/local/bin/caddy.bak /usr/local/bin/caddy-update
+sudo systemctl daemon-reload
+```
+
+**第二步：确认不需要后，删数据**
+
+```bash
+sudo rm -rf /etc/caddy       # Caddyfile、.build-version、.welcome-sha256
+sudo rm -rf /var/lib/caddy   # 证书、ACME 账户、OCSP 缓存
+sudo rm -rf /var/log/caddy
+sudo rm -rf /usr/share/caddy # 站点根目录，放了自己的内容就别删
+```
+
+`/var/lib/caddy` 里是 ACME 账户密钥和已签发的证书。删掉后重装会重新走一遍签发流程，
+同一域名短时间反复申请可能撞上 CA 的速率限制。**只是想换个版本就别删这个目录。**
+
+**第三步：删系统用户**
+
+```bash
+sudo userdel caddy
+sudo groupdel caddy 2>/dev/null || true
+```
+
+这个用户是 `useradd --system --create-home --home-dir /var/lib/caddy` 建的，
+家目录就是数据目录，第二步已经删过。
+
+**顺带检查有没有官方 apt 包**
+
+```bash
+dpkg -l caddy                 # 有输出说明装过官方源的包
+sudo apt-mark unhold caddy    # 之前 hold 过的话
+sudo apt remove --purge caddy
+```
+
+**确认干净**
+
+```bash
+command -v caddy || echo "已清除"
+systemctl status caddy 2>&1 | head -1
+```
+
 ### 国内镜像
 
 每次发布后由 `build.yml` 调用 `mirror.yml` 自动同步到两个国内平台，二进制、
@@ -68,14 +127,26 @@ curl -fsSL https://cnb.cool/ivanabc/caddy-build/-/raw/main/scripts/install.sh | 
   CADDY_MANIFEST=https://cnb.cool/ivanabc/caddy-build/-/raw/main/manifest.txt bash
 ```
 
-用 `CADDY_MANIFEST` 而不是 `CADDY_REL_BASE`：release 附件的地址形状各平台不一样，
-Gitee 是 `attach_files/{数字ID}/download/{文件名}`，数字 ID 只有上传完才知道，
-从 tag 根本推不出来。所以镜像流水线把 API 返回的**真实地址**写成一个
-`manifest.txt` 推进仓库，安装脚本查表即可。这套做法对任何平台都成立，
-以后接新平台不用改安装侧。
+`manifest.txt` 里是流水线从各平台 API **实际拿到**的下载地址，对地址形状不做任何假设。
+Gitee 目前返回的是 `releases/download/{tag}/{文件名}`，和 GitHub 同形，所以
+`CADDY_REL_BASE` 一样能用；但同类平台历史上出现过 `attach_files/{数字ID}/download/{文件名}`
+这种从 tag 推不出来的形状。清单的价值就在于两种情况它都对，平台哪天改了也不用动安装脚本。
 
-清单只描述**最新一版**。要从镜像装指定旧版本，`install.sh` 会明确报错而不是
-装错版本 —— 回退请走 GitHub 源。
+清单只描述**最新一版**。要装指定旧版本，改用 `CADDY_REL_BASE` + `CADDY_TAG`：
+
+```bash
+curl -fsSL https://gitee.com/ivanabc/caddy-build/raw/master/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://gitee.com/ivanabc/caddy-build/raw/master \
+  CADDY_REL_BASE=https://gitee.com/ivanabc/caddy-build/releases/download \
+  CADDY_TAG=v2.11.4-20260807.1930 bash
+```
+
+同时设了 `CADDY_MANIFEST` 和一个对不上的 `CADDY_TAG`，脚本会直接报错停下，
+不会「日志说在装 A、实际下载 B」。
+
+> Gitee 的 raw 地址会 302 跳到 `raw.giteeusercontent.com` 的签名链接。
+> 脚本用的是 `curl -fsSL`（带 `-L`）所以没问题，手动 `curl` 验证时记得加 `-L`，
+> 否则只会看到一段 `<a href="...">Found</a>` 的跳转页。
 
 > 仓库名来自仓库变量 `GITEE_REPO` / `CNB_REPO`，上面写的 `ivanabc/caddy-build`
 > 只是当前的值。
@@ -276,14 +347,21 @@ caddy build-info | grep vcs      # 这个二进制是哪个 commit 编的
 推到 R2，然后**以 GitHub 上还存在的 release 为准**清理旧目录 —— 两边保留策略自动
 一致，也不用担心 tag 字典序排不对（`v2.9` vs `v2.11`）。
 
-### 为什么不推国内平台
+### 镜像里放了什么，没放什么
 
-Gitee 自 2022 年 5 月起，所有新上线的开源仓库需人工审核后才能公开，重新公开要提交
-承诺书，第一条是「不违反任何国家法律法规」。腾讯云 COS、阿里云 OSS 同样要实名，
-且内容会被扫描。
+镜像端只有二进制、`.sha256`、`install.sh`、`dist/*`、一份精简 README 和 `manifest.txt`。
+**不放源码、不放 `plugins.txt`、不放 `go_modules.json`、不放 GitHub 那份带插件版本表的
+release notes。**
 
-而本仓库的二进制里编进了 forwardproxy(naive) 和 trojan。问题不在于仓库可能被下架，
-而在于把实名身份和这个产物绑定。**这条路的障碍不是技术性的。**
+但要清楚一件事：**不同步清单只降低仓库页面的关键词可发现性，不降低产物被识别的概率。**
+Go 把依赖清单写在二进制的 buildinfo 段里，`-ldflags "-w -s"` 剥不掉，
+`strings caddy | grep forwardproxy` 直接命中，不需要运行它。
+
+所以取舍的真实内容是别的：本仓库的二进制编进了 forwardproxy(naive) 和 trojan，
+而 Gitee 自 2022 年 5 月起新建的开源仓库需人工审核才能公开、重新公开要提交承诺书，
+腾讯云 COS、阿里云 OSS 同样要实名且内容会被扫描。风险不在于仓库被下架，
+而在于把实名身份和这个产物绑定。**这条路的障碍不是技术性的**，
+不同步清单帮不上忙 —— 别把「仓库里没写」当成「查不出来」。
 
 ### 关于公共加速站
 

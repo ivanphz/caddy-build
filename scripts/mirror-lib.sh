@@ -84,6 +84,14 @@ MANIFEST_URL=""
 # 清单在镜像仓库里的路径。install.sh 的 CADDY_MANIFEST 指向它。
 MANIFEST_PATH="${MANIFEST_PATH:-manifest.txt}"
 
+# 需要随镜像一起分发的仓库文件 —— install.sh 会从 RAW_BASE 取这些。
+#
+# 单点定义。以前 git 型只同步 install.sh、对象存储型另外列了一份清单，
+# 结果 dist/ 只有 R2 那边有：从 Gitee 装机时 install.sh 拿不到默认 Caddyfile
+# 和欢迎页，只会打印两行「下载失败」然后回落内置副本。往 dist/ 加文件时，
+# 改这一行就够了。
+MIRROR_REPO_FILES="${MIRROR_REPO_FILES:-scripts/install.sh dist/Caddyfile dist/index.html}"
+
 mirror_init() {
   MIRROR_TMPD="$(mktemp -d)"
   REMOTE_ASSETS_FILE="${MIRROR_TMPD}/remote_assets.tsv"
@@ -306,6 +314,7 @@ render_readme() {
   sed -e "s|{{PLATFORM}}|${PLATFORM_NAME}|g" \
       -e "s|{{RAW_BASE}}|${RAW_BASE}|g" \
       -e "s|{{MANIFEST_URL}}|${MANIFEST_URL}|g" \
+      -e "s|{{REL_BASE}}|${PLATFORM_REL_BASE:-$(manifest_url_of caddy-linux-amd64 | sed "s|/${TAG}/caddy-linux-amd64\$||")}|g" \
       -e "s|{{TAG}}|${TAG}|g" \
       -e "s|{{URL_AMD64}}|$(manifest_url_of caddy-linux-amd64)|g" \
       -e "s|{{URL_AMD64_SHA}}|$(manifest_url_of caddy-linux-amd64.sha256)|g" \
@@ -329,7 +338,7 @@ sync_repo() {
 # bootstrap 只在远端分支还不存在时跑一次：建 release 需要 target_commitish，
 # 空仓库没有任何分支会直接失败。正常情况下每次镜像只产生一个提交。
 git_sync_repo() {
-  local br="$1" mode="${2:-full}" work
+  local br="$1" mode="${2:-full}" work f
   work="$(mktemp -d)"
   (
     set -euo pipefail
@@ -343,9 +352,15 @@ git_sync_repo() {
       git reset -q --hard "origin/${br}"
     fi
 
-    mkdir -p scripts
-    cp "${REPO_ROOT}/scripts/install.sh" scripts/install.sh
-    chmod 0755 scripts/install.sh
+    for f in $MIRROR_REPO_FILES; do
+      if [ ! -f "${REPO_ROOT}/${f}" ]; then
+        echo "::warning::${PLATFORM_NAME}: 本仓库没有 ${f}，镜像端会缺这个文件"
+        continue
+      fi
+      mkdir -p "$(dirname "$f")"
+      cp "${REPO_ROOT}/${f}" "$f"
+    done
+    [ -f scripts/install.sh ] && chmod 0755 scripts/install.sh
 
     if [ "$mode" = full ]; then
       cp "$MANIFEST_LOCAL" "$MANIFEST_PATH"
@@ -360,7 +375,7 @@ git_sync_repo() {
     else
       git commit -qm "sync ${TAG}"
       git push -q origin "HEAD:${br}"
-      echo "  ✓ 已推送 README.md / scripts/install.sh${MANIFEST_NOTE:-}"
+      echo "  ✓ 已推送 README.md / ${MIRROR_REPO_FILES}${MANIFEST_NOTE:-}"
     fi
   )
   rm -rf "$work"

@@ -19,8 +19,8 @@ curl -fsSL {{RAW_BASE}}/scripts/install.sh | sudo \
 装完之后 `caddy-update` 命令就可用了。
 
 > `CADDY_MANIFEST` 指向本仓库根目录的 [`manifest.txt`](./manifest.txt)，里面是
-> 「当前版本号 + 每个文件的真实下载地址」。各平台的附件地址形状不一样，
-> 用清单查表比让脚本去拼 URL 可靠 —— 换平台、换存储都不用改安装脚本。
+> 「当前版本号 + 每个文件的真实下载地址」—— 流水线从平台 API 实际拿到的地址，
+> 不靠脚本去猜 URL 形状。换平台、换存储都不用改安装脚本。
 
 ## 更新
 
@@ -39,8 +39,16 @@ sudo caddy-update uninstall     # 卸载二进制和服务（保留配置与数�
 sudo NO_SERVICE=1 caddy-update  # 只更新二进制，不碰 systemd
 ```
 
-> 本镜像只保留最近几个版本，且 `manifest.txt` 始终指向**最新一版**。
-> 需要安装或回退到指定版本，请到 GitHub 源操作。
+> `manifest.txt` 始终指向**最新一版**。要装/回退到指定版本，改用 `CADDY_REL_BASE`：
+>
+> ```bash
+> curl -fsSL {{RAW_BASE}}/scripts/install.sh | sudo \
+>   CADDY_RAW_BASE={{RAW_BASE}} \
+>   CADDY_REL_BASE={{REL_BASE}} \
+>   CADDY_TAG=<版本号> bash
+> ```
+>
+> 本镜像只保留最近几个版本，太旧的请到 GitHub 源取。
 
 ## 手动下载
 
@@ -49,12 +57,13 @@ sudo NO_SERVICE=1 caddy-update  # 只更新二进制，不碰 systemd
 | amd64 | [`caddy-linux-amd64`]({{URL_AMD64}}) | [`.sha256`]({{URL_AMD64_SHA}}) |
 | arm64 | [`caddy-linux-arm64`]({{URL_ARM64}}) | [`.sha256`]({{URL_ARM64_SHA}}) |
 
-安装前请校验：
+安装前请校验（`-L` 不能省，本平台的下载地址会跳转）：
 
 ```bash
 ARCH=amd64   # 或 arm64
-curl -fL -o caddy-linux-$ARCH        "$(awk -F'\t' -v k=caddy-linux-$ARCH        '$1==k{print $2}' <(curl -fsSL {{MANIFEST_URL}}))"
-curl -fL -o caddy-linux-$ARCH.sha256 "$(awk -F'\t' -v k=caddy-linux-$ARCH.sha256 '$1==k{print $2}' <(curl -fsSL {{MANIFEST_URL}}))"
+curl -fsSL {{MANIFEST_URL}} > manifest.txt
+curl -fL -o caddy-linux-$ARCH        "$(awk -F'\t' -v k=caddy-linux-$ARCH        '$1==k{print $2}' manifest.txt)"
+curl -fL -o caddy-linux-$ARCH.sha256 "$(awk -F'\t' -v k=caddy-linux-$ARCH.sha256 '$1==k{print $2}' manifest.txt)"
 sha256sum -c caddy-linux-$ARCH.sha256
 
 sudo install -m 0755 caddy-linux-$ARCH /usr/local/bin/caddy
