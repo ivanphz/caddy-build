@@ -112,10 +112,14 @@ mirror_init() {
 # curl 的进度表用 \r 覆盖同一行，直接进日志会刷屏，所以转成换行后节流取最后一条。
 # curl 必须【不带 -s】—— -s 会把进度表整个关掉，单用 -S 保留报错输出即可。
 
+# 首轮 10 秒就出一行，之后按 $2 的间隔。
+# 两个诉求是矛盾的：既要尽快确认「传起来了、速率大概多少」，又不想让一个
+# 4 分钟的上传刷十几行。首轮短、后续长正好各取所需 —— 一个 68MB 的上传
+# 在 60 秒间隔下只有 4~5 行，而卡死的话 10 秒内就能看出来。
 progress_watch() {   # $1=curl的stderr文件 $2=间隔秒
-  local last="" line
+  local last="" line iv=10
   while :; do
-    sleep "$2"
+    sleep "$iv"; iv="$2"
     [ -s "$1" ] || continue
     line="$(tr '\r' '\n' < "$1" | awk 'NF>=12 && $1 ~ /^[0-9]+$/' | tail -n1)"
     { [ -z "$line" ] || [ "$line" = "$last" ]; } && continue
@@ -124,6 +128,16 @@ progress_watch() {   # $1=curl的stderr文件 $2=间隔秒
     printf '%s\n' "$line" \
       | awk '{printf "    %s%%  %s/%s   当前 %s/s   剩余 %s\n", $5, $6, $2, $12, $11}'
   done
+}
+
+# 速率打印。小文件按 KB/s 算会全是 0（84 字节的 .sha256 传 1.2 秒 = 0.07 KB/s），
+# 不如直接换单位 —— 「上行 0 KB/s」看着像出错了，实际只是四舍五入。
+fmt_speed() {   # $1=字节/秒
+  awk -v s="$1" 'BEGIN{
+    if (s >= 1048576)  printf "%.1f MB/s", s/1048576;
+    else if (s >= 1024) printf "%.0f KB/s", s/1024;
+    else                printf "%.0f B/s",  s;
+  }'
 }
 
 # 启停必须封装。裸写 `kill $PID; wait $PID` 在 set -e 下会炸：

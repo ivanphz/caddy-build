@@ -345,17 +345,104 @@ caddy build-info | grep vcs      # 这个二进制是哪个 commit 编的
 
 ## 镜像到 Cloudflare R2（可选）
 
-受限网络下的第二条下载路径。**不设仓库变量 `R2_BUCKET` 就整个任务跳过**，
-对默认使用者零影响。
+自己可控的第三条下载路径，不依赖任何代码托管平台。**不设 `R2_ACCESS_KEY_ID`
+就整个步骤跳过**，对默认使用者零影响。
 
-| 类型 | 名称 |
-| :--- | :--- |
-| Variables | `R2_BUCKET`、`R2_ACCOUNT_ID`、`R2_PREFIX`（可选，默认 `caddy-build`） |
-| Secrets | `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` |
+### 桶里的布局
 
-每次发布后把二进制、`.sha256`、`install.sh`、`dist/*` 和一个 `latest.txt` 版本指针
-推到 R2，然后**以 GitHub 上还存在的 release 为准**清理旧目录 —— 两边保留策略自动
-一致，也不用担心 tag 字典序排不对（`v2.9` vs `v2.11`）。
+```
+<PREFIX>/<tag>/caddy-linux-amd64        资产，按 tag 分目录
+<PREFIX>/<tag>/caddy-linux-amd64.sha256
+<PREFIX>/main/scripts/install.sh        仓库文件
+<PREFIX>/main/dist/Caddyfile
+<PREFIX>/main/dist/index.html
+<PREFIX>/main/manifest.txt
+<PREFIX>/latest.txt                     最新 tag，给 CADDY_TAG_FILE 用
+```
+
+保留策略**以 GitHub 上还存在的 release 为准**，两边自动一致，也不用担心 tag
+字典序排不对（`v2.9` vs `v2.11`）。和另外两个平台一样，重跑时会先核对资产是否
+齐全，齐全就跳过上传。
+
+### 一、建桶和令牌
+
+1. Cloudflare 控制台 → **R2** → 创建桶。区域选自动即可。
+2. 同一页右侧 **Manage R2 API Tokens** → **Create API token**：
+   - 权限选 **Object Read & Write**
+   - **Specify bucket** 只勾刚建的那个桶（别给账户级权限，这个流水线只需要读写对象）
+   - 创建后会给出 **Access Key ID** 和 **Secret Access Key**，
+     后者**只显示一次**，当场存好
+3. **Account ID** 在 R2 概览页右侧，也可以从控制台 URL 里取。
+
+工作流用的 S3 端点是 `https://<Account ID>.r2.cloudflarestorage.com`，
+由 `R2_ACCOUNT_ID` 拼出来，不用单独配。
+
+### 二、公开访问（可选但强烈建议）
+
+桶默认是私有的。不配公开地址流水线照样跑，只是不生成清单、装机得自己指定地址。
+
+两种开法：
+
+| 方式 | 地址形如 | 适用 |
+| :--- | :--- | :--- |
+| **自定义域**（推荐） | `https://cdn.example.com` | 走 Cloudflare 缓存，可加 WAF / 缓存规则 |
+| r2.dev 子域 | `https://pub-<32位十六进制>.r2.dev` | 只适合临时验证 |
+
+Cloudflare 官方明确说 r2.dev **不是给生产用的**：超过速率限制（每秒几百请求）会返回
+`429`，而且**带宽本身也可能被限速**。这里要发的是 70 MB 的二进制，限速直接体现在
+下载耗时上 —— 用自定义域。
+
+配自定义域：桶 → **Settings** → **Custom Domains** → **Connect Domain**，
+填一个**该 Cloudflare 账户下已托管的域名**的子域，等状态从 Initializing 变成 Active。
+走自定义域还有个附带好处：重复下载命中 Cloudflare 边缘缓存，连 Class B 操作都省了。
+
+### 三、填进 GitHub
+
+`Settings → Secrets and variables → Actions`
+
+| 类型 | 名称 | 值 |
+| :--- | :--- | :--- |
+| Secret | `R2_ACCESS_KEY_ID` | 上面拿到的 Access Key ID |
+| Secret | `R2_SECRET_ACCESS_KEY` | Secret Access Key |
+| Variable | `R2_ACCOUNT_ID` | 账户 ID |
+| Variable | `R2_BUCKET` | 桶名 |
+| **Secret** | `R2_PUBLIC_BASE` | `https://cdn.example.com`（不带尾斜杠） |
+| Variable | `R2_PREFIX` | 可选，默认 `caddy` |
+| Variable | `R2_KEEP` | 可选，默认 12 |
+
+`R2_PUBLIC_BASE` **放 Secrets 而不是 Variables**：本仓库是公开的，GitHub 会把
+step 的 `env:` 块原样打进日志，`vars.*` 明文可见、`secrets.*` 才打码。桶名和账户 ID
+泄露无所谓（没凭据用不了），公开域名泄露就等于把下载地址挂出去了。
+
+### 四、装机
+
+```bash
+curl -fsSL https://cdn.example.com/caddy/main/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://cdn.example.com/caddy/main \
+  CADDY_MANIFEST=https://cdn.example.com/caddy/main/manifest.txt bash
+```
+
+R2 的地址能按 tag 拼出来（和 GitHub 同形），所以还有第二条路 —— 它能装
+**任意还保留着的旧版本**，清单只指向最新一版：
+
+```bash
+curl -fsSL https://cdn.example.com/caddy/main/scripts/install.sh | sudo \
+  CADDY_RAW_BASE=https://cdn.example.com/caddy/main \
+  CADDY_REL_BASE=https://cdn.example.com/caddy \
+  CADDY_TAG_FILE=https://cdn.example.com/caddy/latest.txt bash
+```
+
+两条命令流水线跑完都会打进 Run summary。
+
+### 会不会产生费用
+
+R2 **不收出网带宽费**（任何量级），免费额度是每月 10 GB 存储 + 100 万次 A 类操作
+（写/列举）+ 1000 万次 B 类操作（读）。
+
+按这个项目的量：保留 12 个版本约 1.7 GB 存储，离 10 GB 还远；每次发布约十几次
+A 类操作。B 类操作要一千万次才碰线 —— 也就是一千万次下载。**正常用法下是 0 元。**
+
+真正要盯的是存储：调大 `R2_KEEP` 会线性增长，每个版本约 140 MB。
 
 ### 镜像端排障
 
