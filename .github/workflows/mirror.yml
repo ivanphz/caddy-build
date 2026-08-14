@@ -48,7 +48,9 @@ concurrency:
 
 env:
   TZ: Asia/Shanghai
-  PROGRESS_INTERVAL: '15'   # 上传进度打印间隔（秒）
+  # 上传进度打印间隔（秒）。首轮固定 10 秒，之后按这个值。
+  # 68MB 的上传在 CNB 上约 4 分钟，60 秒间隔正好 4~5 行。
+  PROGRESS_INTERVAL: ${{ vars.PROGRESS_INTERVAL || '60' }}
   REPO_ROOT: ${{ github.workspace }}
   DL_DIR: ${{ github.workspace }}/dl
   BODY_FILE: ${{ github.workspace }}/body.md
@@ -240,8 +242,7 @@ jobs:
                         return 1; }
               progress_stop
               IFS='|' read -r http secs spd <<< "$stat"
-              printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$http" "$secs" \
-                     "$(awk -v s="$spd" 'BEGIN{printf "%.0f", s/1024}')"
+              printf '  HTTP %s | 用时 %.1fs | 上行 %s\n' "$http" "$secs" "$(fmt_speed "$spd")"
               url="$(jq -r '.browser_download_url // .download_url // empty' \
                      "${MIRROR_TMPD}/upload.json" 2>/dev/null || true)"
               [ -n "$url" ] || {
@@ -292,7 +293,7 @@ jobs:
               printf 'ASSETS=%q\n'    "$names"
               printf 'GH_BASE=%q\n'   "https://github.com/${GH_REPO_FULL}/releases/download/${TAG}"
               printf 'SHA_LINES=%q\n' "$(cat "${DL_DIR}"/*.sha256)"
-              printf 'INTERVAL=%q\n'  "${PROGRESS_INTERVAL:-15}"
+              printf 'INTERVAL=%q\n'  "${PROGRESS_INTERVAL:-60}"
               cat <<'REMOTE'
           set -euo pipefail
           command -v curl >/dev/null || { echo "远端缺少 curl"; exit 1; }
@@ -312,9 +313,9 @@ jobs:
           printf '%s\n' "$SHA_LINES" > SHA256SUMS
 
           progress_watch() {
-            local last="" line
+            local last="" line iv=10
             while :; do
-              sleep "$INTERVAL"
+              sleep "$iv"; iv="$INTERVAL"
               [ -s "$1" ] || continue
               line="$(tr '\r' '\n' < "$1" | awk 'NF>=12 && $1 ~ /^[0-9]+$/' | tail -n1)"
               { [ -z "$line" ] || [ "$line" = "$last" ]; } && continue
@@ -532,8 +533,7 @@ jobs:
                 || { progress_stop; echo "  PUT 失败 ${a}: $(progress_tail)"; return 1; }
               progress_stop
               IFS='|' read -r http secs spd <<< "$stat"
-              printf '  HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$http" "$secs" \
-                     "$(awk -v s="$spd" 'BEGIN{printf "%.0f", s/1024}')"
+              printf '  HTTP %s | 用时 %.1fs | 上行 %s\n' "$http" "$secs" "$(fmt_speed "$spd")"
               case "$http" in 2*) ;; *) echo "  PUT ${a} 返回 HTTP $http"; return 1 ;; esac
 
               # verify_url 形如 .../asset-upload-confirmation/{upload_token}/{asset_path}
