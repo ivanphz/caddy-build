@@ -215,7 +215,7 @@ jobs:
 
       # 二进制 + 校验和：两个架构都有
       - name: Upload Binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: caddy-${{ matrix.goarch }}
           if-no-files-found: error
@@ -226,7 +226,7 @@ jobs:
       # 元数据：只有 amd64 有，单独上传避免 arm64 刷 warning
       - name: Upload Metadata
         if: matrix.goarch == 'amd64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: metadata
           if-no-files-found: error
