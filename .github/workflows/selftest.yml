@@ -13,11 +13,13 @@ on:
     paths:
       - 'scripts/install.sh'
       - 'scripts/contract-selftest.sh'
+      - 'scripts/contract-mutation-check.sh'
       - 'CONTRACT.md'
   pull_request:
     paths:
       - 'scripts/install.sh'
       - 'scripts/contract-selftest.sh'
+      - 'scripts/contract-mutation-check.sh'
       - 'CONTRACT.md'
   workflow_dispatch:
 
@@ -34,39 +36,8 @@ jobs:
         run: bash scripts/contract-selftest.sh scripts/install.sh
 
       # 一套在任何代码上都通过的测试什么都没测。
-      # 这里把 install.sh 的关键行为逐个打断，确认对应用例真的会红 ——
-      # 实测逼出过一个空档：K/L 走的都是「清单」那条路，
-      # 给 latest_tag 加回 2>/dev/null 仍然全绿，于是补了 L2。
+      # 这一步把 install.sh 的关键行为逐条打断，确认自测真的会红。
+      # 锚点放在脚本里而不是这里：它们是多行的原文片段，塞进 `run: |` 的
+      # 块标量会撑破缩进；放脚本里还能和它保护的断言待在同一个目录。
       - name: Verify the selftest can fail
-        run: |
-          set -euo pipefail
-          orig="$(mktemp)"; cp scripts/install.sh "$orig"
-          restore() { cp "$orig" scripts/install.sh; }
-          trap restore EXIT
-
-          mutate() {   # <说明> <原文> <替换>
-            restore
-            python3 - "$2" "$3" <<'PY'
-          import sys
-          p='scripts/install.sh'; s=open(p,encoding='utf-8').read()
-          a,b=sys.argv[1],sys.argv[2]
-          assert s.count(a)==1, f"变异锚点不唯一/不存在: {a[:60]}"
-          open(p,'w',encoding='utf-8').write(s.replace(a,b))
-          PY
-            if bash scripts/contract-selftest.sh scripts/install.sh >/dev/null 2>&1; then
-              echo "::error::打断了「$1」之后自测仍然全绿 —— 这条行为没有被任何用例覆盖"
-              return 1
-            fi
-            echo "  ✓ 打断「$1」→ 自测变红"
-          }
-
-          mutate 'manifest_contract 无条件输出' \
-            '  printf '"'"'manifest_contract=%s\n'"'"' "${mc:-none}"' \
-            '  if [ -n "$MANIFEST" ]; then printf '"'"'manifest_contract=%s\n'"'"' "$mc"; fi'
-
-          mutate 'latest_tag 的诊断不被吞' \
-            '    lt="$(latest_tag)" || lt=""' \
-            '    lt="$(latest_tag 2>/dev/null)" || lt=""'
-
-          restore
-          echo "全部变异都被抓住"
+        run: bash scripts/contract-mutation-check.sh

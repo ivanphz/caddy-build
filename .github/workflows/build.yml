@@ -362,6 +362,50 @@ jobs:
       # 「一键降级」：一年前的二进制带着一年份未修补的 CVE，却能被 CADDY_TAG=
       # 直接装回任何一台机器。保留数量可用仓库变量 KEEP_RELEASES 覆盖
       #（Settings → Secrets and variables → Actions → Variables）。
+      # 钉 tag 换来了可复现，但也把「这个地址能不能用」从「main 一直在那儿」
+      # 变成了「每次发布都要成立一次」—— 新增的假设要有新增的检查。
+      #
+      # 镜像侧已经有逐字节比对的绊线，GitHub 侧不能没有对等的一条：
+      # 一旦这个 URL 取不到，失败会落在几十台消费机器上，而不是这里。
+      #
+      # 刻意放在 Create Release 之后、mirror 之前：release job 红了
+      # mirror 就不会跑，一份引用不可用地址的清单不会继续外溢。
+      - name: Verify manifest install_sh is reachable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          url="$(awk -F'\t' '$1=="install_sh"{print $2; exit}' manifest.txt)"
+          [ -n "$url" ] || { echo "::error::清单里没有 install_sh 行"; exit 1; }
+          echo "校验: $url"
+
+          # curl 的 --retry 不重试 404，而这里要等的恰恰是
+          # raw.githubusercontent.com 对刚创建的 tag 的传播窗口。自己循环。
+          probe=/tmp/probe_install.sh
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL --connect-timeout 20 --max-time 60 -o "$probe" "$url"; then
+              ok=1; break
+            fi
+            echo "  第 ${i}/6 次取不到，10 秒后重试（新 tag 的 CDN 传播窗口）"
+            sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "::error::清单里的 install_sh 取不到: $url"; exit 1; }
+
+          # 不写成 `head -c2 | grep -q`：本仓库已经为这个形状栽过两次
+          #（grep 提前关管道 → 上游 SIGPIPE → pipefail 判整条失败）。
+          first2="$(head -c2 "$probe")"
+          [ "$first2" = '#!' ] \
+            || { echo "::error::install_sh 取到的不是脚本（开头是 '${first2}'）: $url"; exit 1; }
+
+          # 顺带确认它就是本次发布的那一份，而不是 CDN 给的旧副本
+          if cmp -s "$probe" scripts/install.sh; then
+            echo "✓ 可达，且与本次发布的 install.sh 逐字节相同"
+          else
+            echo "::error::install_sh 可达但内容与本次发布的不一致: $url"
+            exit 1
+          fi
+
       # 清理失败不该把一次成功的发布标红：产物已经发出去了，少删几个旧版本
       # 下次构建会补上。真正需要红的是编译和发布，不是垃圾回收。
       - name: Prune old releases
