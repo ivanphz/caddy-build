@@ -33,7 +33,7 @@ jobs:
       build_time: ${{ steps.ver.outputs.time }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # 版本号只在这里生成一次，两个架构共用，避免跨分钟产生不同 tag。
       #
@@ -85,10 +85,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: 'stable'
           check-latest: true
@@ -236,7 +236,7 @@ jobs:
 
       # 二进制 + 校验和：两个架构都有
       - name: Upload Binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: caddy-${{ matrix.goarch }}
           if-no-files-found: error
@@ -247,7 +247,7 @@ jobs:
       # 元数据：只有 amd64 有，单独上传避免 arm64 刷 warning
       - name: Upload Metadata
         if: matrix.goarch == 'amd64'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: metadata
           if-no-files-found: error
@@ -262,7 +262,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
