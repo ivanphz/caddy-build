@@ -166,7 +166,35 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 
 ---
 
-## 8. 别让整文件覆盖悄悄回退 Dependabot
+## 8. `caddy-update` 的自更新链路还没版本化
+
+**现状**：整条链路上，只有 `install.sh` 本身是活动引用。
+
+| 东西 | 有没有版本 | 能不能回滚 |
+| :--- | :--- | :--- |
+| 二进制 | tag | ✅ 用旧 tag |
+| 清单 | release 资产，随 tag 不可变 | ✅ 用旧清单 |
+| 契约 | `contract` 整数 | ✅ 消费者按范围拒绝 |
+| 清单里的 `install_sh` | 已钉到 tag（2026-09 修） | ✅ |
+| **`caddy-update` 自己取的 `install.sh`** | **分支** | ❌ |
+
+`write_helper` 把 `CADDY_RAW_BASE` 固化进 `/usr/local/bin/caddy-update`，
+每次运行都从那个**分支**地址重新取 `install.sh`。往 `main` 推一个坏的，
+所有机器下次 `caddy-update` 一起坏，唯一补救是再往 `main` 推一次。
+
+> 镜像那三条没有这个问题：镜像仓库只接受流水线推送，分支上的 `install.sh`
+> 永远等于「最近一次发布的那份」。只有 GitHub 源的 `main` 会收手工提交。
+
+**方向**：让 helper 改成「先取清单 → 用清单里的 `install_sh`」，而不是按
+`RAW_BASE` 拼。这样 `install.sh` 也变成发布门控的，坏提交要到切 release 才会外溢。
+
+**代价**：`install.sh` 的修复必须切一个 release 才发得出去，把两件独立的事耦合了。
+而且改的是已经跑在几十台机器上的 helper，**风险不对称**——升级路径本身出问题时
+没有别的路可走。真要做，先让新旧两种 helper 并存一个发布周期。
+
+---
+
+## 9. 别让整文件覆盖悄悄回退 Dependabot
 
 **现状**：改动以「整文件覆盖」的方式落到仓库。而 `.github/workflows/*.yml`
 同时也是 **Dependabot 的地盘** —— 它每月会去改那里的 `uses:` 行。
@@ -198,3 +226,5 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 | 2026-09 | 下游消费契约（`CONTRACT.md`）：`contract` 版本号、`--check`、清单发到 GitHub |
 | 2026-09 | Actions 全部升到 Node 24 运行时（Node 20 于 2026-09-16 从 runner 移除） |
 | 2026-09 | 三个平台 + GitHub 全链路跑通并实测：清单、契约、完整性检查、缓存头 |
+| 2026-09 | 文档按读者角色拆成 6 份，README 从 974 行减到 85 行 |
+| 2026-09 | `--check` 补上清单契约校验与 stderr 诊断；GitHub 清单的 `install_sh` 钉到 tag |

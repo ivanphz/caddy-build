@@ -662,19 +662,57 @@ do_uninstall() {
 #
 # 退出码是这个子命令契约的一部分：
 #   0  探测成功（不管有没有新版本）
-#   1  探测失败：拿不到最新版本号（网络不通 / 清单坏了 / 源地址错）
+#   1  探测失败：拿不到最新版本号（网络不通 / 清单坏了 / 清单契约读不懂 / 源地址错）
 #   3  本机没装 caddy
+#
+# 两者同时成立时【返回 1】—— 真故障压过正常结论。反过来的话，一批网络不通的机器
+# 会被报成「未安装」，然后你去装，然后装不上。
 #
 # 「有新版本」绝不用非零表达 —— --check 回答的是问句不是命令，
 # 混在一起会让调用方分不清「有更新」和「探测失败」，
 # 而这两件事在 33 台机器的扫描结果里是完全不同的处理方式。
 # 3 单独分出来是因为「没装」对舰队审计是个正常结论，不该和真故障混为一谈。
 do_check() {
-  local cur="" lt="" active ec=0
+  local cur="" lt="" active ec=0 mc="" unreadable=0 _mf_err=""
 
   if [ -x "$BIN_PATH" ]; then
     cur="$(installed_tag)"
     [ -n "$cur" ] || cur=unknown     # 装了但没状态文件
+  fi
+
+  # 清单的契约版本要【先】看。
+  #
+  # contract 变大意味着「已有键的含义可能变了」—— 那就连里面的 tag 都不该照读，
+  # 否则等于用旧规则去解释新格式，正是这个数字存在要防的事。
+  # 少了这一步，--check 会对一份装不上去的清单报 would_change=yes（假绿灯），
+  # 而 install 在同一份清单上直接 die —— 「先问再决定」问了个寂寞。
+  if [ -n "$MANIFEST" ]; then
+    # 先单独探一次清单能不能读。
+    # fetch_manifest 内部用的是 die（exit），每次调用失败都会重新报一遍；
+    # 不先挡住的话，一份软 404 的清单会把同一个原因打三遍
+    #（查 contract 一次、latest_tag 里再一次、然后「缺少 tag 行」一次）。
+    # 放子 shell 里跑，die 只杀得掉子 shell，同时把消息接出来只打一遍。
+    _mf_err="$(mktemp)"
+    if ! ( fetch_manifest >/dev/null ) 2>"$_mf_err"; then
+      [ -s "$_mf_err" ] && cat "$_mf_err" >&2
+      rm -f "$_mf_err"
+      mc=unknown
+      unreadable=1
+    else
+      rm -f "$_mf_err"
+      mc="$(manifest_get contract)" || mc=""
+      mc="${mc:-1}"                  # 没有 contract 行 = 契约诞生前的老清单
+    fi
+    [ "$unreadable" = 1 ] || case "$mc" in
+      ''|*[!0-9]*)
+        c_ylw "清单的 contract 值不是整数: '${mc}'，不解读这份清单"
+        unreadable=1 ;;
+      *)
+        if [ "$mc" -gt "$CONTRACT_VERSION" ]; then
+          c_ylw "清单声明 contract=${mc}，本脚本只支持到 ${CONTRACT_VERSION} —— 读不懂，不解读其中的 tag。请先更新 install.sh。"
+          unreadable=1
+        fi ;;
+    esac
   fi
 
   # 这里不能 die：探测不到要能说出「探测不到」，而不是整个脚本退场。
@@ -684,10 +722,17 @@ do_check() {
   # 子 shell 里的 || true 根本没机会执行；命令替换于是返回非零，
   # errexit 把整个脚本带走 —— 表现是 --check 一行不输出就退出码 1。
   # || 必须放在父层才拦得住。
-  if [ -n "$TAG" ]; then
+  #
+  # 也【不要】给它加 2>/dev/null：latest_tag 的 die 消息（「清单内容不像清单」、
+  # 「从 URL 解析不出 tag，代理可能改写了跳转」）正是 rc=1 时唯一能说明原因的东西。
+  # 吞掉它，扫 33 台机器时那几台 rc=1 就只剩「不知道为什么」。
+  # stdout 依然只有 key=value —— 诊断本来就该走 stderr。
+  if [ "$unreadable" = 1 ]; then
+    lt=""
+  elif [ -n "$TAG" ]; then
     lt="$TAG"
   else
-    lt="$(latest_tag 2>/dev/null)" || lt=""
+    lt="$(latest_tag)" || lt=""
   fi
 
   if ! command -v systemctl >/dev/null 2>&1; then
@@ -699,6 +744,11 @@ do_check() {
   fi
 
   printf 'contract=%s\n' "$CONTRACT_VERSION"
+  # contract= 是【本机这份脚本】的版本，manifest_contract= 是【清单声明】的版本。
+  # 两个数字必须各有各的键 —— 合成一个，消费者一定会认错是哪一个。
+  if [ -n "$MANIFEST" ]; then
+    printf 'manifest_contract=%s\n' "$mc"
+  fi
   printf 'current=%s\n'  "${cur:-none}"
   printf 'latest=%s\n'   "${lt:-unknown}"
   if [ -z "$lt" ]; then

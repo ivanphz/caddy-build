@@ -56,12 +56,30 @@ caddy-linux-arm64.sha256   https://.../caddy-linux-arm64.sha256
 
 | 清单来自 | `install_sh` 指向 |
 | :--- | :--- |
-| GitHub Release | `raw.githubusercontent.com/…` |
+| GitHub Release | `raw.githubusercontent.com/<repo>/<tag>/scripts/install.sh` |
 | Gitee | `gitee.com/…/raw/master/scripts/install.sh` |
 | CNB | `cnb.cool/…/-/git/raw/main/scripts/install.sh` |
 | R2 | `<你的域>/caddy/main/scripts/install.sh` |
 
 消费者拿到清单之后**不需要再推断任何路径**。
+
+### 为什么 GitHub 那条钉了 tag
+
+清单是不可变的 release 资产，里面每一项都该是不可变的。指向 `main` 等于在
+「某一版的快照」里塞一个活动引用——往 `main` 推一个坏的 `install.sh`，
+所有按清单消费的机器下一次全都坏，而且**没有回滚路径**。钉到 tag 之后
+每份清单都是自洽可复现的单元，回滚就是用旧清单。
+
+代价是 `install.sh` 的修复要切一个 release 才发得出去。这个代价是对的：
+改的是跑在几十台机器上的东西，本来就该走发布流程。
+
+镜像那三条看起来是分支引用，但性质相同：**镜像仓库只接受发布流水线的推送**，
+没有人手工往那里提交，所以分支上的 `install.sh` 永远等于「最近一次发布的那份」。
+`main` 会收手工提交，镜像分支不会——这是两者的区别。
+
+> 唯一还没版本化的是 `caddy-update` 自身的自更新链路（它按安装时固化的
+> `CADDY_RAW_BASE` 取 `install.sh`，走的是分支）。见
+> [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ### 清单在哪
 
@@ -113,6 +131,7 @@ stdout **只有** `key=value` 行，诊断信息一律走 stderr：
 
 ```
 contract=1
+manifest_contract=1
 current=v2.11.3-20260701.0900
 latest=v2.11.4-20260813.1110
 would_change=yes
@@ -121,7 +140,8 @@ service_active=yes
 
 | 键 | 取值 |
 | :--- | :--- |
-| `contract` | 本机这份 `install.sh` 的契约版本 |
+| `contract` | **本机这份 `install.sh`** 的契约版本 |
+| `manifest_contract` | **清单声明**的契约版本；只在用清单时出现，读不到清单时是 `unknown` |
 | `current` | 已装的 tag；没装是 `none`；装了但没状态文件是 `unknown` |
 | `latest` | 目标版本；探测不到是 `unknown` |
 | `would_change` | `yes` / `no` / `unknown` |
@@ -132,8 +152,19 @@ service_active=yes
 | 码 | 含义 |
 | :--- | :--- |
 | `0` | 探测成功（**不管有没有新版本**） |
-| `1` | 探测失败：拿不到最新版本号（网络不通 / 清单坏了 / 源地址错） |
+| `1` | 探测失败：拿不到最新版本号（网络不通 / 清单坏了 / 清单契约读不懂 / 源地址错） |
 | `3` | 本机没装 caddy |
+
+**`1` 和 `3` 同时成立时返回 `1`** —— 真故障压过正常结论。反过来的话，
+一批网络不通的机器会被报成「未安装」，然后你去装，然后装不上。
+
+清单声明的 `contract` 超出本机支持范围时，`--check` 返回 `1` 而不是报
+`would_change=yes`：contract 变大意味着已有键的含义可能变了，那就连里面的 `tag`
+都不该照读。少了这一步，`--check` 会对一份**注定装不上去**的清单开绿灯，
+而 `install` 在同一份清单上直接 die —— 「先问再决定」就白问了。
+
+rc 非 0 时，原因**一定会打在 stderr 上**（stdout 仍然只有 `key=value`）。
+扫一批机器时那几台 rc=1 不会只剩「不知道为什么」。
 
 「有新版本」绝不用非零表达——`--check` 回答的是问句不是命令。混在一起会让调用方
 分不清「有更新」和「探测失败」，而这两件事在几十台机器的扫描结果里是完全不同的
@@ -185,7 +216,7 @@ curl -fsSL "$install_url" -o "$s"
 head -c2 "$s" | grep -q '^#!' || { echo "取到的不是脚本"; exit 1; }
 
 # 4. 先问，再决定动不动
-out="$(sudo bash "$s" --check)"; rc=$?
-[ "$rc" -ne 1 ] || { echo "探测失败"; exit 1; }
+out="$(bash "$s" --check)"; rc=$?     # --check 不需要 root
+[ "$rc" -ne 1 ] || { echo "探测失败，原因见上面的 stderr"; exit 1; }
 case "$out" in *would_change=yes*) sudo CADDY_MANIFEST="$manifest" bash "$s" ;; esac
 ```
