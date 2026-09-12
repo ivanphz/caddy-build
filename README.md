@@ -396,6 +396,26 @@ Cloudflare 官方明确说 r2.dev **不是给生产用的**：超过速率限制
 填一个**该 Cloudflare 账户下已托管的域名**的子域，等状态从 Initializing 变成 Active。
 走自定义域还有个附带好处：重复下载命中 Cloudflare 边缘缓存，连 Class B 操作都省了。
 
+### 为什么是 `aws` 命令和 `AWS_*` 变量
+
+不是写错了。R2 对外提供的**就是 S3 协议**——Cloudflare 刻意这么做，好让现有 S3
+工具链一行不改直接用。
+
+`aws` CLI 本质是个通用 S3 客户端，`--endpoint-url` 指到
+`<账户ID>.r2.cloudflarestorage.com`，它谈话的对象就是 Cloudflare，不会有任何流量
+走到亚马逊。`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` 只是这个客户端读凭据用的
+变量名，装进去的是 Cloudflare 生成的密钥——反过来看更清楚：Cloudflare 那个页面叫
+「R2 API Tokens」，产出的东西却偏偏叫 **Access Key ID** 和 **Secret Access Key**，
+就是为了直接塞进 S3 工具里。
+
+另外两个变量：`AWS_DEFAULT_REGION=auto` 是因为 R2 没有区域概念，但 SigV4 签名串里
+这个字段不能为空；两个 `*_CHECKSUM_*` 是关掉新版 aws CLI 默认加的 CRC32 校验头，
+R2 不吃这套。
+
+不用 `wrangler` 的原因：`aws` 在 ubuntu runner 上预装，`wrangler` 要装 Node 工具链
+且用另一套凭据；而且 S3 是这类对象存储事实上的通用接口，以后换 OSS / COS / MinIO
+适配器几乎不用改。
+
 ### 三、填进 GitHub
 
 `Settings → Secrets and variables → Actions`
@@ -409,6 +429,7 @@ Cloudflare 官方明确说 r2.dev **不是给生产用的**：超过速率限制
 | **Secret** | `R2_PUBLIC_BASE` | `https://cdn.example.com`（不带尾斜杠） |
 | Variable | `R2_PREFIX` | 可选，默认 `caddy` |
 | Variable | `R2_KEEP` | 可选，默认 12 |
+| Variable | `R2_CACHE_SECONDS` | 可选，默认 60，见下 |
 
 `R2_PUBLIC_BASE` **放 Secrets 而不是 Variables**：本仓库是公开的，GitHub 会把
 step 的 `env:` 块原样打进日志，`vars.*` 明文可见、`secrets.*` 才打码。桶名和账户 ID
@@ -433,6 +454,52 @@ curl -fsSL https://cdn.example.com/caddy/main/scripts/install.sh | sudo \
 ```
 
 两条命令流水线跑完都会打进 Run summary。
+
+### 缓存
+
+接了自定义域之后，Cloudflare 边缘按对象自带的 `Cache-Control` 决定缓存多久，
+所以这个头在**上传时**就写进对象元数据，分两类：
+
+| 对象 | `Cache-Control` | 理由 |
+| :--- | :--- | :--- |
+| `<PREFIX>/<tag>/*` | `max-age=31536000, immutable` | 内容与 tag 绑定，永不变更 |
+| `<PREFIX>/main/*`、`latest.txt` | `max-age=60` | 每次发布都变 |
+
+后者要是缓存久了，会出现「**发了新版，`caddy-update` 却看不到**」——服务端明明
+更新了，客户端读到的还是旧 `latest.txt` / `manifest.txt`。这类故障很难查，
+所以宁可让它每分钟回源一次。`R2_CACHE_SECONDS` 可调。
+
+> 只有新上传的对象带这个头。已经在桶里的旧版本产物不会被追加，
+> 但它们本来就不变，没影响；而每次都会重传的 `main/*` 和 `latest.txt`
+> 下一次跑就带上了。
+
+### AccessDenied 排查
+
+流水线开跑就会做一次预检（列举 + 写一个几字节的探针再删掉），
+所以问题会在两秒内报出来，而不是传到一半才炸。
+
+看到 `读不了存储桶` 或 `桶能读但写不了` 时，最快的定性方式是在本地直接试：
+
+```bash
+export AWS_ACCESS_KEY_ID=<你的>  AWS_SECRET_ACCESS_KEY=<你的>
+export AWS_DEFAULT_REGION=auto
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+E=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+
+aws s3 ls --endpoint-url $E s3://<桶名>/            # 读
+echo hi | aws s3 cp - --endpoint-url $E s3://<桶名>/_probe.txt   # 写
+aws s3 rm --endpoint-url $E s3://<桶名>/_probe.txt
+```
+
+| 现象 | 原因 |
+| :--- | :--- |
+| 读能过、写 `AccessDenied` | 令牌权限选成了 **Object Read only**，重建一个 **Object Read & Write** 的 |
+| 读就 `AccessDenied` | 桶名拼错（区分大小写）／ Account ID 是别的账户 ／ 令牌 **Specify bucket** 勾的不是这个桶 |
+| `InvalidAccessKeyId` / `SignatureDoesNotMatch` | Key ID 与 Secret 不配对，多半是复制时串了行 |
+
+> `aws s3 ls --endpoint-url $E`（不带桶名）报 `AccessDenied` 是**正常的** ——
+> 那是 ListBuckets，按最小权限原则本就不该给对象级令牌。别在这上面浪费时间。
 
 ### 会不会产生费用
 

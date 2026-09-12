@@ -59,6 +59,8 @@
 #   platform_fetch_asset <name> <url> <dst> 取回一个小文件用于校验
 #                        默认 = curl。私有存储桶用自己的凭据取（如 aws s3 cp），
 #                        免得为了做完整性校验被迫开公开读。
+#   platform_preflight                      开跑前自检凭据/权限，失败要 mdie 并说清
+#                        原因。放在最前面：与其传到一半才被拒，不如两秒内讲明白。
 #   platform_raw_candidates                 逐行打印候选 raw 基址（{BRANCH} 已替换）
 #                        定义了就会在推送后逐个探测，选中真正能取到内容的那个。
 #                        raw 的路径形状没有任何跨平台标准，猜错的表现极隐蔽 ——
@@ -585,6 +587,9 @@ mirror_run() {
   mirror_init
 
   mstep "${PLATFORM_NAME}"
+  if declare -F platform_preflight >/dev/null 2>&1; then
+    platform_preflight
+  fi
   resolve_branch
   RAW_BASE="${PLATFORM_RAW_BASE//\{BRANCH\}/$MIRROR_BRANCH}"
   MANIFEST_URL="${RAW_BASE}/${MANIFEST_PATH}"
