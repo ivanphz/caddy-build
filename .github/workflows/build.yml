@@ -222,7 +222,6 @@ jobs:
         env:
           TAG: ${{ needs.init.outputs.version_tag }}
           REPO: ${{ github.repository }}
-          REF: ${{ github.event.repository.default_branch || 'main' }}
         run: |
           set -euo pipefail
           CV="$(awk '/^CONTRACT_VERSION=/{sub(/^CONTRACT_VERSION=/,""); sub(/[^0-9].*$/,""); print; exit}' scripts/install.sh)"
@@ -230,7 +229,18 @@ jobs:
           {
             printf 'contract\t%s\n' "$CV"
             printf 'tag\t%s\n' "$TAG"
-            printf 'install_sh\thttps://raw.githubusercontent.com/%s/%s/scripts/install.sh\n' "$REPO" "$REF"
+            # install_sh 钉到 tag，不指向 main。
+            #
+            # 清单是不可变的 release 资产，里面每一项都该是不可变的；指向 main
+            # 等于在一份「某一版的快照」里塞一个活动引用 —— 往 main 推一个坏的
+            # install.sh，所有按清单消费的机器下一次全都坏，而且没有回滚路径。
+            # 钉到 tag 之后每份清单都是自洽可复现的单元，回滚 = 用旧清单。
+            # 代价是 install.sh 的修复要切一个 release 才发得出去 —— 这个代价
+            # 是对的：改的是跑在几十台机器上的东西，本来就该走发布流程。
+            #
+            # 这个 tag 由本次 release 创建，清单作为 release 资产同时发布，
+            # 所以清单可见时 tag 必然已存在。
+            printf 'install_sh\thttps://raw.githubusercontent.com/%s/%s/scripts/install.sh\n' "$REPO" "$TAG"
           } > manifest_head.txt
           cat manifest_head.txt
 
