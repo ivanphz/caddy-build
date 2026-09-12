@@ -33,7 +33,7 @@ jobs:
       build_time: ${{ steps.ver.outputs.time }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       # 版本号只在这里生成一次，两个架构共用，避免跨分钟产生不同 tag。
       #
@@ -85,10 +85,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v5
         with:
           go-version: 'stable'
           check-latest: true
@@ -213,9 +213,30 @@ jobs:
       - name: Generate Checksum
         run: sha256sum "${{ env.ASSET }}" > "${{ env.ASSET }}.sha256"
 
+      # 清单的头三行。资产行由 release job 从实际产物生成 ——
+      # 那里才知道到底构建出了哪些文件，写死一份名单就又多一个会分叉的地方。
+      #
+      # contract 从 scripts/install.sh 抠，那一行是全仓唯一真源。
+      - name: Generate Manifest Head
+        if: matrix.goarch == 'amd64'
+        env:
+          TAG: ${{ needs.init.outputs.version_tag }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          CV="$(awk '/^CONTRACT_VERSION=/{sub(/^CONTRACT_VERSION=/,""); sub(/[^0-9].*$/,""); print; exit}' scripts/install.sh)"
+          [ -n "$CV" ] || { echo "::error::scripts/install.sh 里读不到 CONTRACT_VERSION"; exit 1; }
+          {
+            printf 'contract\t%s\n' "$CV"
+            printf 'tag\t%s\n' "$TAG"
+            printf 'install_sh\thttps://raw.githubusercontent.com/%s/%s/scripts/install.sh\n' "$REPO" "$REF"
+          } > manifest_head.txt
+          cat manifest_head.txt
+
       # 二进制 + 校验和：两个架构都有
       - name: Upload Binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: caddy-${{ matrix.goarch }}
           if-no-files-found: error
@@ -226,7 +247,7 @@ jobs:
       # 元数据：只有 amd64 有，单独上传避免 arm64 刷 warning
       - name: Upload Metadata
         if: matrix.goarch == 'amd64'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: metadata
           if-no-files-found: error
@@ -234,15 +255,39 @@ jobs:
             final_note.md
             go_modules.json
             main.go
+            manifest_head.txt
 
   release:
     needs: [init, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      # 清单也发到 GitHub，消费者就只剩一条代码路径 —— 永远查清单，
+      # 不再有「这个源查表、那个源拼 URL」的分支。清单的存在理由本来就是
+      # 「不要拼 URL」，那它不该只对镜像成立。
+      #
+      # 资产行直接从下载回来的产物生成：构建出什么就写什么，
+      # 不维护第二份文件名单。
+      - name: Generate Manifest
+        env:
+          TAG: ${{ needs.init.outputs.version_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cp artifacts/metadata/manifest_head.txt manifest.txt
+          for f in artifacts/caddy-*/*; do
+            n="$(basename "$f")"
+            printf '%s\thttps://github.com/%s/releases/download/%s/%s\n' \
+                   "$n" "$REPO" "$TAG" "$n"
+          done | sort >> manifest.txt
+          echo "--- manifest.txt ---"; cat manifest.txt
+          # 行数 = 3 行头 + 每架构 2 个文件。少了就是产物没下全。
+          [ "$(wc -l < manifest.txt)" -ge 7 ] \
+            || { echo "::error::清单行数异常，产物可能没下全"; exit 1; }
 
       - name: Prepare Release Body
         run: |
@@ -260,11 +305,16 @@ jobs:
             echo '```bash'
             echo "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch || 'main' }}/scripts/install.sh | sudo bash"
             echo '```'
+            echo ""
+            echo "自动化消费者用清单（永远指向最新一版）："
+            echo '```'
+            echo "https://github.com/${{ github.repository }}/releases/latest/download/manifest.txt"
+            echo '```'
           } >> body.md
           cat body.md
 
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.init.outputs.version_tag }}
           name: ${{ needs.init.outputs.version_tag }}
@@ -274,6 +324,7 @@ jobs:
             artifacts/caddy-arm64/*
             artifacts/metadata/go_modules.json
             artifacts/metadata/main.go
+            manifest.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
