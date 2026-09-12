@@ -116,6 +116,13 @@ check "H 正常清单 → manifest_contract=1" 0 "$(M ok.txt)" \
 check "I 无 contract 行的老清单 → 按 1 处理，不拦" 0 "$(M nocontract.txt)" \
       "manifest_contract=1" "would_change=no"
 
+# unknown 和 none 是两个不同的结论，对应两种不同的处置：
+#   none  出现在本该有清单的机器上 → 编排把 CADDY_MANIFEST 弄丢了，查编排
+#   unknown                        → 清单源挂了 / 软 404，查镜像
+# 不测的话，哪天有人把 mc=unknown 改成 mc=none，19/19 照样全绿。
+check "H2 清单设了但读不出来 → unknown（不是 none）" 1 "$(M soft404.txt)" \
+      "manifest_contract=unknown" "latest=unknown" "would_change=unknown"
+
 # J 不能断言 rc：没设 MANIFEST 时 --check 会真的去问 GitHub，
 # 结果取决于当前网络和线上版本。契约在这里要求的只是【键必须存在】。
 # 断言里混进环境依赖，等于给自己埋一个随机失败的用例。

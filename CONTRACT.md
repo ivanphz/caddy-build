@@ -168,8 +168,12 @@ service_active=yes
 
 | 原因 | `manifest_contract` | 动作 |
 | :--- | :--- | :--- |
-| 网络不通 / 源地址错 / 清单取到的是 HTML | `none` 或 `unknown` | 重试、查网络 |
-| **清单契约版本高于本机 `install.sh`** | 一个大于 `contract=` 的整数 | **更新全网 install.sh**，重试永远不会好 |
+| 设了清单但读不出来（源挂了 / 软 404 / 地址错） | `unknown` | **查镜像** |
+| 根本没设清单，且版本探测也失败 | `none` | 本该有清单的机器上出现 `none` = 编排把 `CADDY_MANIFEST` 弄丢了，**查编排** |
+| **清单契约版本高于本机 `install.sh`** | 大于 `contract=` 的整数 | **更新全网 install.sh**，重试永远不会好 |
+
+`none` 和 `unknown` 刻意分开：前者是「没给我清单」，后者是「给了但读不到」，
+排查方向完全不同——一个在编排侧，一个在镜像侧。
 
 **为什么不给契约不兼容单独一个退出码**：新增退出码是 contract +1，代价太大；
 而区分能力并没有丢——契约不兼容是**全网同时发生**的（大家读的是同一份清单），
@@ -228,7 +232,9 @@ scripts/contract-selftest.sh                       # 默认测 scripts/install.s
 scripts/contract-selftest.sh /path/to/install.sh   # 测任意一份
 ```
 
-CI 在 `install.sh` 或这个脚本本身变更时自动跑（`.github/workflows/selftest.yml`）。
+CI 在 `install.sh` 或这两个脚本本身变更时自动跑（`.github/workflows/selftest.yml`），
+两步：先跑自测，再跑 [`scripts/contract-mutation-check.sh`](scripts/contract-mutation-check.sh)
+——把 install.sh 的关键行为逐条打断，确认自测真的会红。
 
 > **怎么知道这套测试本身有效**：它必须能在打断了对应行为的代码上失败。
 > 实测四种变异各自只打红对应用例：条件输出 `manifest_contract` → `J` 红；
