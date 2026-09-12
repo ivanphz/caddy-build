@@ -73,9 +73,18 @@ caddy-linux-arm64.sha256   https://.../caddy-linux-arm64.sha256
 代价是 `install.sh` 的修复要切一个 release 才发得出去。这个代价是对的：
 改的是跑在几十台机器上的东西，本来就该走发布流程。
 
-镜像那三条看起来是分支引用，但性质相同：**镜像仓库只接受发布流水线的推送**，
-没有人手工往那里提交，所以分支上的 `install.sh` 永远等于「最近一次发布的那份」。
-`main` 会收手工提交，镜像分支不会——这是两者的区别。
+镜像那三条看起来是分支引用，但性质不同：
+
+> **不变量**：镜像仓库只接受发布流水线的推送。
+> `main` 会收手工提交，镜像分支不会——所以镜像分支上的 `install.sh`
+> 永远等于「最近一次发布的那份」。
+>
+> **若将来允许手工往镜像推，本决定必须重新评估**，届时镜像清单的
+> `install_sh` 也要钉 tag。
+
+这条不靠人记：`mirror.yml` 每次推完会回读镜像上的 `scripts/install.sh`，
+**与本次发布的那份逐字节比对**，对不上就告警。手工热修、缓存没刷新、
+推丢了，三种情况都会在镜像那一步当场暴露，而不是等某台机器装出问题。
 
 > 唯一还没版本化的是 `caddy-update` 自身的自更新链路（它按安装时固化的
 > `CADDY_RAW_BASE` 取 `install.sh`，走的是分支）。见
@@ -141,7 +150,7 @@ service_active=yes
 | 键 | 取值 |
 | :--- | :--- |
 | `contract` | **本机这份 `install.sh`** 的契约版本 |
-| `manifest_contract` | **清单声明**的契约版本；只在用清单时出现，读不到清单时是 `unknown` |
+| `manifest_contract` | **清单声明**的契约版本。**无条件输出**：没用清单时是 `none`，清单读不到时是 `unknown`。条件出现的键是坑——消费者写 `[ "$mc" -le 1 ]` 会在没有清单的机器上拿到空串然后报 `integer expression expected` |
 | `current` | 已装的 tag；没装是 `none`；装了但没状态文件是 `unknown` |
 | `latest` | 目标版本；探测不到是 `unknown` |
 | `would_change` | `yes` / `no` / `unknown` |
@@ -149,22 +158,34 @@ service_active=yes
 
 退出码也是契约的一部分：
 
-| 码 | 含义 |
-| :--- | :--- |
-| `0` | 探测成功（**不管有没有新版本**） |
-| `1` | 探测失败：拿不到最新版本号（网络不通 / 清单坏了 / 清单契约读不懂 / 源地址错） |
-| `3` | 本机没装 caddy |
+| 码 | 含义 | 该采取的动作 |
+| :--- | :--- | :--- |
+| `0` | 探测成功（**不管有没有新版本**） | 看 `would_change` |
+| `1` | 探测失败 | 见下 |
+| `3` | 本机没装 caddy | 装 |
+
+`1` 涵盖两类原因，**动作完全不同**，靠 `manifest_contract` 区分：
+
+| 原因 | `manifest_contract` | 动作 |
+| :--- | :--- | :--- |
+| 网络不通 / 源地址错 / 清单取到的是 HTML | `none` 或 `unknown` | 重试、查网络 |
+| **清单契约版本高于本机 `install.sh`** | 一个大于 `contract=` 的整数 | **更新全网 install.sh**，重试永远不会好 |
+
+**为什么不给契约不兼容单独一个退出码**：新增退出码是 contract +1，代价太大；
+而区分能力并没有丢——契约不兼容是**全网同时发生**的（大家读的是同一份清单），
+表现为几十台一起 `rc=1`，和「五台零散失败」一眼能分；真要精确判，
+输出里的 `manifest_contract` 就是那个判据。
 
 **`1` 和 `3` 同时成立时返回 `1`** —— 真故障压过正常结论。反过来的话，
 一批网络不通的机器会被报成「未安装」，然后你去装，然后装不上。
 
-清单声明的 `contract` 超出本机支持范围时，`--check` 返回 `1` 而不是报
-`would_change=yes`：contract 变大意味着已有键的含义可能变了，那就连里面的 `tag`
-都不该照读。少了这一步，`--check` 会对一份**注定装不上去**的清单开绿灯，
-而 `install` 在同一份清单上直接 die —— 「先问再决定」就白问了。
+契约超版本时 `--check` 返回 `1` 而不是 `would_change=yes`：contract 变大意味着
+已有键的含义可能变了，那就连里面的 `tag` 都不该照读。少了这一步，`--check` 会对
+一份**注定装不上去**的清单开绿灯，而 `install` 在同一份清单上直接 die ——
+「先问再决定」就白问了。
 
 rc 非 0 时，原因**一定会打在 stderr 上**（stdout 仍然只有 `key=value`）。
-扫一批机器时那几台 rc=1 不会只剩「不知道为什么」。
+扫一批机器时那几台 `rc=1` 不会只剩「不知道为什么」。
 
 「有新版本」绝不用非零表达——`--check` 回答的是问句不是命令。混在一起会让调用方
 分不清「有更新」和「探测失败」，而这两件事在几十台机器的扫描结果里是完全不同的
@@ -186,6 +207,8 @@ rc 非 0 时，原因**一定会打在 stderr 上**（stdout 仍然只有 `key=v
 | `CADDY_RAW_BASE` / `CADDY_REL_BASE` | 换源 |
 | `CADDY_TAG_FILE` | 纯文本版本指针（R2 的 `latest.txt`） |
 | `NO_SERVICE=1` | 只换二进制不碰 systemd |
+| `NO_HELPER=1` | 不写 `/usr/local/bin/caddy-update`。**被编排统一管理的机群应该用它** —— 留着一个没人用的更新入口，谁手工跑一次就绕开了编排的单点写入，而且没有任何东西会报 |
+| `CADDY_CONF_DIR` / `_DATA_DIR` / `_LOG_DIR` / `_SITE_DIR` / `CADDY_UNIT` | 覆盖安装路径 |
 | 清单与 `CADDY_TAG` 对不上时 **die** | **正确行为**，防静默错版，不会改成「警告后继续」 |
 | 安装顺序 | 下载 → 校验 SHA256 → 备份 → 原子替换 → validate → 重启 → 确认存活，任一步失败自动回滚 |
 | 旧仓库名 `my-custom-caddy` 的重定向 | 不会新建同名仓库 |
@@ -193,6 +216,28 @@ rc 非 0 时，原因**一定会打在 stderr 上**（stdout 仍然只有 `key=v
 改动其中任何一条 = `contract` +1。
 
 ---
+
+## 契约的可执行版本
+
+写在 Markdown 里的承诺会漂，写成断言的不会。
+[`scripts/contract-selftest.sh`](scripts/contract-selftest.sh) 是本文档的可执行版本，
+19 条断言，不需要网络、不需要 root、不碰真实系统目录：
+
+```bash
+scripts/contract-selftest.sh                       # 默认测 scripts/install.sh
+scripts/contract-selftest.sh /path/to/install.sh   # 测任意一份
+```
+
+CI 在 `install.sh` 或这个脚本本身变更时自动跑（`.github/workflows/selftest.yml`）。
+
+> **怎么知道这套测试本身有效**：它必须能在打断了对应行为的代码上失败。
+> 实测四种变异各自只打红对应用例：条件输出 `manifest_contract` → `J` 红；
+> 吞掉 `latest_tag` 的诊断 → `L2` 红；契约超版本不拒绝解读 → `G` 红；
+> 去掉子 shell 预探（同一原因报三遍）→ `K`/`L` 红。
+>
+> `L2` 就是变异测试逼出来的：原来只有 `K`/`L`，两条走的都是**清单**那条路，
+> 而清单的诊断来自子 shell 预探——给 `latest_tag` 加回 `2>/dev/null` 仍然全绿。
+> 不走清单的那条路径必须单独测。
 
 ## 消费端最小实现
 

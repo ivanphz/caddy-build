@@ -533,7 +533,25 @@ verify_repo_files() {
     for f in $pending; do
       url="${RAW_BASE}/${f}"
       case "$f" in
-        */install.sh)     code="$(url_serves "$url" shebang)"  || true ;;
+        */install.sh)     code="$(url_serves "$url" shebang)"  || true
+                          # 光验「是个脚本」不够：镜像分支「只接受流水线推送」
+                          # 是当前流程的性质，不是被强制的不变量。有人手工热修一次，
+                          # 这个假设就静默失效了。这里直接比哈希 —— 手工改过、
+                          # 缓存没刷新、推丢了，三种情况都在这里当场暴露。
+                          #
+                          # 先落盘再 cmp，不写成 `curl | cmp -s -`：cmp 发现不同
+                          # 会立刻退出，curl 接着写就吃 SIGPIPE，pipefail 判整条
+                          # 管道失败。这里恰好结论一样所以不出错，但这个形状本仓库
+                          # 已经栽过两次，不留它。
+                          if [ "$code" = 200 ] && [ -f "${REPO_ROOT}/${f}" ]; then
+                            if curl -sSL --connect-timeout 20 --max-time 60 \
+                                    -o "${MIRROR_TMPD}/served" "$url" 2>/dev/null; then
+                              cmp -s "${MIRROR_TMPD}/served" "${REPO_ROOT}/${f}" \
+                                || code=content-mismatch
+                            else
+                              code=fetch-failed
+                            fi
+                          fi ;;
         "$MANIFEST_PATH") code="$(url_serves "$url" manifest)" || true ;;
         *)                code="$(url_serves "$url" any)"      || true ;;
       esac
@@ -550,7 +568,17 @@ verify_repo_files() {
   done
 
   for f in $still; do
-    mwarn "${PLATFORM_NAME}: ${RAW_BASE}/${f%%|*} 读不到 (HTTP ${f##*|})。产物已上传；若只是平台 raw 缓存没刷新，过几分钟自己会好，安装脚本也会自动回落备用源。持续如此说明这个文件根本没推上去，或被平台拦了。"
+    case "${f##*|}" in
+      content-mismatch)
+        mwarn "${PLATFORM_NAME}: ${RAW_BASE}/${f%%|*} 内容与本次发布的不一致。可能是平台 raw 缓存没刷新（过几分钟自己会好），也可能有人手工往镜像推过东西 —— 镜像仓库本应只接受流水线推送，这条不变量失效的话，清单里 install_sh 指向分支的做法就必须重新评估（见 CONTRACT.md）。"
+        ;;
+      soft404)
+        mwarn "${PLATFORM_NAME}: ${RAW_BASE}/${f%%|*} 返回了 200 但内容不对（软 404）。多半是地址形状写错了，或平台对这类路径返回 HTML 错误页。"
+        ;;
+      *)
+        mwarn "${PLATFORM_NAME}: ${RAW_BASE}/${f%%|*} 读不到 (${f##*|})。产物已上传；若只是平台 raw 缓存没刷新，过几分钟自己会好，安装脚本也会自动回落备用源。持续如此说明这个文件根本没推上去，或被平台拦了。"
+        ;;
+    esac
   done
 }
 

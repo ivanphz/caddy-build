@@ -28,6 +28,14 @@
 #
 #   CADDY_REPO=owner/repo           指定其它仓库
 #   CADDY_REF=main                  仓库文件取哪个分支/tag（默认 main）
+#   CADDY_CONF_DIR / CADDY_DATA_DIR / CADDY_LOG_DIR / CADDY_SITE_DIR / CADDY_UNIT
+#                                   覆盖安装路径（默认 /etc/caddy、/var/lib/caddy、
+#                                   /var/log/caddy、/usr/share/caddy、
+#                                   /etc/systemd/system/caddy.service）
+#   NO_HELPER=1                     不写 /usr/local/bin/caddy-update。
+#                                   被舰队编排统一管理的机器用 —— 留着一个
+#                                   「装了但没人用」的更新入口，谁手工跑一次
+#                                   就绕开了编排的单点写入，而且没有任何东西会报。
 #   CADDY_RAW_FALLBACK=<url>        主源取不到 dist/* 时的备用源，
 #                                   默认 jsDelivr；设成空串禁用
 #   CADDY_TAG=v2.11.4-20260807.1930 安装指定版本，默认 latest
@@ -55,14 +63,18 @@ WELCOME="${WELCOME:-1}"
 # 让用户记住这个细节没有意义，这里统一补上。
 [ -z "$GH_MIRROR" ] || GH_MIRROR="${GH_MIRROR%/}/"
 
-CONF_DIR=/etc/caddy
+# 目录全部可覆盖。这不只是「灵活性」——CONF_DIR 写死曾经让契约自测脚本
+# 必须能写真实的 /etc/caddy 才能跑，测不了的东西就没人测。
+# 五个一起开，不能只开一半：unit 引 CONF_FILE / DATA_DIR / LOG_DIR，
+# 内置 Caddyfile 引 SITE_DIR，卸载要按同一组路径删。
+CONF_DIR="${CADDY_CONF_DIR:-/etc/caddy}"
 CONF_FILE="$CONF_DIR/Caddyfile"
-DATA_DIR=/var/lib/caddy
-LOG_DIR=/var/log/caddy
-SITE_DIR=/usr/share/caddy
+DATA_DIR="${CADDY_DATA_DIR:-/var/lib/caddy}"
+LOG_DIR="${CADDY_LOG_DIR:-/var/log/caddy}"
+SITE_DIR="${CADDY_SITE_DIR:-/usr/share/caddy}"
 STATE_FILE="$CONF_DIR/.build-version"   # 记录已安装的 release tag
 WELCOME_STATE="$CONF_DIR/.welcome-sha256"  # 记录本脚本上次写下的欢迎页指纹
-UNIT=/etc/systemd/system/caddy.service
+UNIT="${CADDY_UNIT:-/etc/systemd/system/caddy.service}"
 HELPER=/usr/local/bin/caddy-update
 
 # ---- 下载来源解析 ----
@@ -459,6 +471,11 @@ write_default_config() {
     # https://caddyserver.com/docs/caddyfile
 CADDYFILE_EOF
   fi
+  # 默认路径下内置副本不动一个字节 —— 「与上游逐字节相同」是刻意的反指纹选择。
+  # 只有显式覆盖了 SITE_DIR 才改 root 那一行（那是一次自觉的偏离）。
+  if [ "$SITE_DIR" != /usr/share/caddy ]; then
+    sed -i "s|^\([[:space:]]*root \* \)/usr/share/caddy\$|\1${SITE_DIR}|" "$CONF_FILE"
+  fi
   chown caddy:caddy "$CONF_FILE"
   info "配置文件: $CONF_FILE"
 }
@@ -590,7 +607,16 @@ do_install() {
 
   # helper 必须在 NO_SERVICE 分支之前写：不写的话，用 NO_SERVICE=1 装的机器
   # 连 caddy-update 命令都没有，下次更新只能重新去记那一长串环境变量。
-  write_helper
+  #
+  # NO_HELPER=1 例外：被舰队编排统一管理的机器上，caddy-update 是一条
+  # 「装了但从不使用」的死路径 —— 谁 SSH 上去手工跑一次，那台机器的版本
+  # 就和编排记录的对不上了，而且没有任何东西会报。干脆不装这个入口。
+  if [ "${NO_HELPER:-0}" = 1 ]; then
+    info "已跳过 caddy-update（NO_HELPER=1）"
+    rm -f "$HELPER"
+  else
+    write_helper
+  fi
 
   if [ "${NO_SERVICE:-0}" = 1 ]; then
     rm -f "${BIN_PATH}.bak"
@@ -746,9 +772,12 @@ do_check() {
   printf 'contract=%s\n' "$CONTRACT_VERSION"
   # contract= 是【本机这份脚本】的版本，manifest_contract= 是【清单声明】的版本。
   # 两个数字必须各有各的键 —— 合成一个，消费者一定会认错是哪一个。
-  if [ -n "$MANIFEST" ]; then
-    printf 'manifest_contract=%s\n' "$mc"
-  fi
+  #
+  # 【无条件输出】。条件出现的键是坑：消费者写
+  #   mc="$(... awk ...)"; [ "$mc" -le 1 ] || exit 1
+  # 在没有清单的机器上会拿到空串，然后 "integer expression expected"。
+  # 输出形状恒定比少一行重要得多。没有清单时值是 none。
+  printf 'manifest_contract=%s\n' "${mc:-none}"
   printf 'current=%s\n'  "${cur:-none}"
   printf 'latest=%s\n'   "${lt:-unknown}"
   if [ -z "$lt" ]; then

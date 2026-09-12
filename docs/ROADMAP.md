@@ -88,7 +88,7 @@ platforms:
 
 | 位置 | 现状 | 该怎样 |
 | :--- | :--- | :--- |
-| `install.sh` 的目录常量 | `/etc/caddy`、`/var/lib/caddy`、`/var/log/caddy`、`/usr/share/caddy`、`/etc/systemd/system/caddy.service` 全部写死，只有 `BIN_PATH` 能用 `CADDY_BIN` 覆盖 | 一组 `CADDY_CONF_DIR` / `CADDY_DATA_DIR` / `CADDY_LOG_DIR` / `CADDY_SITE_DIR` / `CADDY_UNIT`。注意它们同时出现在 systemd unit 模板、内置 Caddyfile、卸载流程里，**要一起改，不能只开一半** |
+| ~~`install.sh` 的目录常量~~ | ~~全部写死~~ | ✅ **2026-09 已做**：`CADDY_CONF_DIR` / `CADDY_DATA_DIR` / `CADDY_LOG_DIR` / `CADDY_SITE_DIR` / `CADDY_UNIT` 五个一起开。触发点是可测性——`CONF_DIR` 写死导致契约自测必须能写真实 `/etc/caddy`，**测不了的东西就没人测** |
 | `bench-mirror.sh` 的用法示例 | 注释里写死 `ivanphz/caddy-build` / `ivanabc/caddy-build` | 换成 `<owner>/<repo>` |
 | `install.sh` 头部注释的安装地址 | 写死完整 URL | 同上 |
 | 服务名 `caddy` | unit 名、用户名、组名都硬编码 `caddy` | 同机装两份（比如一个测试实例）时会打架 |
@@ -166,7 +166,7 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 
 ---
 
-## 8. `caddy-update` 的自更新链路还没版本化
+## 8. `caddy-update` 在编排管理的机器上是条死路径
 
 **现状**：整条链路上，只有 `install.sh` 本身是活动引用。
 
@@ -179,18 +179,29 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 | **`caddy-update` 自己取的 `install.sh`** | **分支** | ❌ |
 
 `write_helper` 把 `CADDY_RAW_BASE` 固化进 `/usr/local/bin/caddy-update`，
-每次运行都从那个**分支**地址重新取 `install.sh`。往 `main` 推一个坏的，
-所有机器下次 `caddy-update` 一起坏，唯一补救是再往 `main` 推一次。
+每次运行都从那个**分支**地址重新取 `install.sh`，而且**不读清单里的 `install_sh` 键**。
 
-> 镜像那三条没有这个问题：镜像仓库只接受流水线推送，分支上的 `install.sh`
-> 永远等于「最近一次发布的那份」。只有 GitHub 源的 `main` 会收手工提交。
+这里有两个不同的机群，走两条不同的升级路，`install_sh` 钉 tag 只解决了其中一条：
 
-**方向**：让 helper 改成「先取清单 → 用清单里的 `install_sh`」，而不是按
-`RAW_BASE` 拼。这样 `install.sh` 也变成发布门控的，坏提交要到切 release 才会外溢。
+| 机群 | 升级路径 | 钉清单管不管用 |
+| :--- | :--- | :--- |
+| 舰队机（编排统一管） | 编排自己取 `install.sh` | ✅ 管用——编排改成读清单的 `install_sh` 键即可 |
+| 手工装的机器 | `caddy-update` → `RAW_BASE`（分支） | ❌ 不管用 |
 
-**代价**：`install.sh` 的修复必须切一个 release 才发得出去，把两件独立的事耦合了。
-而且改的是已经跑在几十台机器上的 helper，**风险不对称**——升级路径本身出问题时
-没有别的路可走。真要做，先让新旧两种 helper 并存一个发布周期。
+**优先级重估**：舰队机上 `caddy-update` 是**装了但从不使用**的死路径。
+真正的风险不是「升级会坏」，而是——
+
+> 有人 SSH 上去手工跑一次 `caddy-update`，就绕开了编排的单点写入者模型，
+> 那台机器的版本从此和编排记录的对不上，而且没有任何东西会报。
+
+**已做的便宜解**（2026-09）：`NO_HELPER=1` —— 编排装机时干脆不写这个入口，
+和 `NO_SERVICE=1` 同形。休眠的违反项从此不存在。
+
+**剩下的**：手工装的机器仍然走分支。彻底解法是让 helper 改成
+「先取清单 → 用清单里的 `install_sh`」，这样 `install.sh` 也变成发布门控的。
+**代价**：`install.sh` 的修复必须切一个 release 才发得出去；而且改的是跑在
+几十台机器上的升级路径，**风险不对称**——升级路径本身出问题时没有别的路可走。
+真要做，先让新旧两种 helper 并存一个发布周期。
 
 ---
 
@@ -228,3 +239,5 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 | 2026-09 | 三个平台 + GitHub 全链路跑通并实测：清单、契约、完整性检查、缓存头 |
 | 2026-09 | 文档按读者角色拆成 6 份，README 从 974 行减到 85 行 |
 | 2026-09 | `--check` 补上清单契约校验与 stderr 诊断；GitHub 清单的 `install_sh` 钉到 tag |
+| 2026-09 | 安装路径五个目录全部可覆盖；新增 `NO_HELPER=1` |
+| 2026-09 | `scripts/contract-selftest.sh`（19 条断言）+ CI 变异检测；镜像内容一致性绊线 |

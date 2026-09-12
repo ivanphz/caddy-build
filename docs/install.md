@@ -163,6 +163,34 @@ sudo CADDY_TAG=v2.11.4-20260807.1930 caddy-update
 
 仓库文件默认取 `main` 分支，可用 `CADDY_REF=` 改（自建镜像分支名不同时用得上）。
 
+### 安装路径
+
+五个目录都可以覆盖，默认值是上游 `.deb` 包的那一套：
+
+| 变量 | 默认 |
+| :--- | :--- |
+| `CADDY_BIN` | `/usr/local/bin/caddy` |
+| `CADDY_CONF_DIR` | `/etc/caddy`（Caddyfile、`.build-version`、`.welcome-sha256`） |
+| `CADDY_DATA_DIR` | `/var/lib/caddy`（证书、ACME 账户） |
+| `CADDY_LOG_DIR` | `/var/log/caddy` |
+| `CADDY_SITE_DIR` | `/usr/share/caddy` |
+| `CADDY_UNIT` | `/etc/systemd/system/caddy.service` |
+
+systemd unit 和内置 Caddyfile 都按这组变量生成，改一个其余自动跟上。
+内置 Caddyfile 在默认路径下与上游**逐字节相同**（刻意的，见
+[design.md](design.md#关于默认页与指纹)）；只有显式覆盖了 `CADDY_SITE_DIR`
+才会改 `root` 那一行。
+
+### 被编排统一管理的机器
+
+```bash
+curl -fsSL <install.sh> | sudo NO_HELPER=1 bash
+```
+
+`NO_HELPER=1` 不写 `/usr/local/bin/caddy-update`。机器由舰队编排统一升级时，
+那个命令是一条**装了但从不使用**的死路径 —— 谁 SSH 上去手工跑一次，这台机器的
+版本就和编排记录的对不上了，而且没有任何东西会报。干脆不装这个入口。
+
 `dist/Caddyfile` 和 `dist/index.html` 这两个小文件在主源取不到时会自动改用
 `CADDY_RAW_FALLBACK`（默认 jsDelivr），设成空串禁用。二进制不走这条路。
 取不到时会打出 HTTP 状态码 —— 404 是镜像没同步到，403 是平台拦了，000 是没连上，
