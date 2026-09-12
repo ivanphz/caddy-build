@@ -354,8 +354,11 @@ jobs:
                     -F "file=@${a}" 2>"$PE")" || { pstop; echo "上传中断 $a: $(ptail)"; exit 1; }
             pstop
             IFS='|' read -r HTTP SECS SPD <<< "$STAT"
-            printf '      HTTP %s | 用时 %ss | 上行 %s KB/s\n' "$HTTP" "$SECS" \
-                   "$(awk -v s="$SPD" 'BEGIN{printf "%.0f", s/1024}')"
+            printf '      HTTP %s | 用时 %.1fs | 上行 %s\n' "$HTTP" "$SECS" \
+                   "$(awk -v s="$SPD" 'BEGIN{
+                        if (s >= 1048576)  printf "%.1f MB/s", s/1048576;
+                        else if (s >= 1024) printf "%.0f KB/s", s/1024;
+                        else                printf "%.0f B/s",  s }')"
             # 不依赖远端有 jq：把 JSON 拆行后抠出 browser_download_url，
             # 顺手把 \/ 还原成 /（部分服务端会转义正斜杠）
             # 末尾不接 head -n1：它读到一行就关管道，上游 sed 收 SIGPIPE，
@@ -376,7 +379,11 @@ jobs:
 
             # tee 保留实时输出，同时把 __ASSET__ 标记行留下来给清单用。
             # pipefail 已开，ssh 非零会正确传播。
-            ssh "${sshopt[@]}" "${RELAY_USER}@${RELAY_HOST}" 'bash -s' < "$relay" | tee "$log"
+            # 末尾的 sed 只影响「给人看的那一份」，$log 里仍保留 __ASSET__ 供解析。
+            # 用 sed 而不是 grep -v：后者在全部被过滤掉时返回 1，
+            # 处在管道末尾会被 pipefail 判成失败 —— 这个坑本仓库踩过两次。
+            ssh "${sshopt[@]}" "${RELAY_USER}@${RELAY_HOST}" 'bash -s' < "$relay" \
+              | tee "$log" | sed '/^__ASSET__/d'
 
             awk -F'\t' '$1=="__ASSET__"{print $2"\t"$3}' "$log" >> "$ASSET_URL_FILE"
           }
