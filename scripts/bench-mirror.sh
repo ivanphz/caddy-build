@@ -3,11 +3,11 @@
 # 镜像链路测速：在任意机器上跑，测出这台机器做中转值不值。
 #
 # 用法：
-#   ./bench-mirror.sh dl    ivanphz/caddy-build                 # GitHub 下载速度
-#   ./bench-mirror.sh gitee ivanabc/caddy-build "$GITEE_TOKEN"  # Gitee 上传速度
-#   ./bench-mirror.sh cnb   ivanabc/caddy-build "$CNB_TOKEN"    # CNB 上传速度
+#   ./bench-mirror.sh dl    <owner>/<repo>                      # GitHub 下载速度
+#   ./bench-mirror.sh gitee <owner>/<repo>      "$GITEE_TOKEN"  # Gitee 上传速度
+#   ./bench-mirror.sh cnb   <owner>/<repo>      "$CNB_TOKEN"    # CNB 上传速度
 #   ./bench-mirror.sh all   ...                                 # 见下方 all 用法
-#   ./bench-mirror.sh purge gitee ivanabc/caddy-build "$TOKEN"  # 清理遗留的 bench-* release
+#   ./bench-mirror.sh purge gitee <owner>/<repo>      "$TOKEN"  # 清理遗留的 bench-* release
 #
 # 环境变量：
 #   SIZE_MB=20            测试文件大小，默认 20（正式产物约 72M，按比例外推即可）

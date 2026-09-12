@@ -474,7 +474,15 @@ url_serves() {   # $1=url $2=期望特征 shebang|manifest|any
   first="${first%$'\r'}"
   case "$2" in
     shebang)  case "$first" in '#!'*)          ;; *) printf 'soft404'; return 1 ;; esac ;;
-    manifest) case "$first" in "tag"$'\t'*)    ;; *) printf 'soft404'; return 1 ;; esac ;;
+    manifest)
+      # 首行的键只可能是这三个之一。这里【不要】只认 tag ——
+      # 上一版给清单加了 contract 首行，忘了同步改这里，结果三个平台
+      # 一起报 manifest.txt soft404，而文件其实推得好好的。
+      # 判据和 install.sh 里 fetch_manifest 的那份必须一致。
+      case "$first" in
+        contract$'\t'*|tag$'\t'*|install_sh$'\t'*) ;;
+        *) printf 'soft404'; return 1 ;;
+      esac ;;
   esac
   printf '200'
 }
