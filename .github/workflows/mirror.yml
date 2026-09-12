@@ -571,10 +571,24 @@ jobs:
       - name: Push to Cloudflare R2
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' && env.R2_KEY != '' }}
         env:
+          # 为什么用 aws CLI 和 AWS_* 变量名连 R2 —— 这里不是写错了：
+          #
+          # R2 对外提供的就是 S3 协议。aws CLI 本质是个通用 S3 客户端，
+          # --endpoint-url 指到 <账户ID>.r2.cloudflarestorage.com，它谈话的对象
+          # 就是 Cloudflare，不会有任何流量走到亚马逊。AWS_ACCESS_KEY_ID /
+          # AWS_SECRET_ACCESS_KEY 只是这个客户端读凭据用的变量名，装进去的是
+          # Cloudflare 控制台生成的密钥 —— Cloudflare 那个页面叫「R2 API Tokens」，
+          # 产出的东西却偏偏叫 Access Key ID / Secret Access Key，就是为了直接
+          # 塞进 S3 工具里。
+          #
+          # 选它而不是 wrangler：aws CLI 在 ubuntu runner 上预装，wrangler 要装
+          # Node 工具链且用的是另一套凭据（Cloudflare API Token）。而且 S3 是这类
+          # 对象存储事实上的通用接口，以后换 OSS / COS / MinIO 适配器几乎不用改。
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # R2 没有区域概念，但 SigV4 签名串里这个字段不能为空，用 auto 占位
           AWS_DEFAULT_REGION: auto
-          # R2 不支持 aws-cli v2 默认开启的分块校验头，必须关掉
+          # 新版 aws CLI 默认给每个请求加 CRC32 校验头，R2 不吃这套，必须关掉
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
           BUCKET: ${{ vars.R2_BUCKET }}
@@ -588,6 +602,9 @@ jobs:
           ONLY: ${{ vars.R2_ASSETS }}
           BRANCH: ${{ vars.R2_NAMESPACE }}
           KEEP: ${{ vars.R2_KEEP || 12 }}
+          # main/ 下文件和 latest.txt 的边缘缓存秒数。默认 60：发新版后一分钟内
+          # 全网可见，同时挡掉绝大部分重复回源。
+          R2_CACHE_SECONDS: ${{ vars.R2_CACHE_SECONDS || '60' }}
         run: |
           set -euo pipefail
           source "${REPO_ROOT}/scripts/ci-lib.sh"
@@ -612,6 +629,18 @@ jobs:
           S3="s3://${BUCKET}/${PREFIX}"
           AWS=(aws s3 --endpoint-url "$ENDPOINT")
 
+          # 缓存头必须在上传时就写进对象元数据 —— 接了自定义域之后，
+          # Cloudflare 边缘按这个决定缓存多久。分两类：
+          #
+          #   <tag>/ 下的产物：内容与 tag 绑定，永不变更，尽量长期缓存
+          #   main/ 下的文件和 latest.txt：每次发布都变，缓存久了会出现
+          #                                「发了新版但 caddy-update 看不到」
+          #
+          # 后者是个很难查的故障：服务端明明更新了，客户端读到的还是旧 tag。
+          # 与其等它发生，不如上传时就把话说死。
+          CACHE_IMMUTABLE='public, max-age=31536000, immutable'
+          CACHE_MUTABLE="public, max-age=${R2_CACHE_SECONDS:-60}"
+
           PLATFORM_NAME='Cloudflare R2'
           PLATFORM_KIND='object'
           PLATFORM_DEFAULT_BRANCH='main'   # 仓库文件的路径命名空间，不是 git 分支
@@ -626,6 +655,27 @@ jobs:
 
           # ---------------- 适配器 ----------------
 
+          # 开跑前把凭据和权限验清楚。
+          #
+          # 不做这件事的后果实测过一次：token 没有写权限时，前面每一步都「成功」
+          # （列举失败被 2>/dev/null 吞掉 → 判定为「前缀不存在」→ 建 release →
+          # 开始上传），直到 PutObject 才抛一句光秃秃的 AccessDenied。
+          # 探针只有几字节，两秒内就能把话说清楚。
+          platform_preflight() {
+            local out probe
+            if ! out="$("${AWS[@]}" ls "s3://${BUCKET}/" 2>&1)"; then
+              mdie "R2: 读不了存储桶 ${BUCKET}（${out}）。逐项核对: ① R2_BUCKET 与控制台里的桶名完全一致（区分大小写）；② R2_ACCOUNT_ID 是这个桶所在账户的 ID；③ API 令牌的 Specify bucket 勾的就是这个桶；④ 令牌权限至少是 Object Read。"
+            fi
+
+            probe="${MIRROR_TMPD}/preflight"
+            printf 'preflight\n' > "$probe"
+            if ! out="$("${AWS[@]}" cp "$probe" "${S3}/.preflight" --only-show-errors 2>&1)"; then
+              mdie "R2: 桶能读但写不了（${out}）。几乎可以肯定是 API 令牌的权限选成了 Object Read only —— 到 Cloudflare 控制台 R2 → Manage R2 API Tokens 重建一个 Object Read & Write 的令牌，把新的 Access Key ID / Secret Access Key 换进 GitHub Secrets。"
+            fi
+            "${AWS[@]}" rm "${S3}/.preflight" --only-show-errors >/dev/null 2>&1 || true
+            mlog "凭据与读写权限正常"
+          }
+
           platform_release_find() {
             # 对象存储没有 release 实体，一个 tag 前缀存在就当它存在。
             # id 就用 tag 本身，prune 那边照样对得上。
@@ -634,8 +684,15 @@ jobs:
             # 上游收到 SIGPIPE 退出非零，set -o pipefail 于是判定整条管道失败，
             # if 走进 else —— 结果是「前缀明明在，却永远说不存在」，
             # 完整性检查形同虚设，每次照样重传 140MB。实测就是这么翻车的。
-            local out
-            out="$("${AWS[@]}" ls "${S3}/${1}/" 2>/dev/null || true)"
+            #
+            # 也不要把 stderr 丢掉：aws 对「前缀不存在」是退出 1 且不输出，
+            # 对「没权限」是退出 1 并打印错误 —— 一律吞掉就分不出这两件事，
+            # 表现为「凭据坏了却说 release 不存在」，然后一路走到上传才炸。
+            local out rc=0
+            out="$("${AWS[@]}" ls "${S3}/${1}/" 2>&1)" || rc=$?
+            if [ "$rc" != 0 ] && [ -n "$out" ]; then
+              mdie "R2: 列举 ${S3}/${1}/ 失败: ${out}"
+            fi
             if [ -n "$out" ]; then RELEASE_ID="$1"; else RELEASE_ID=""; fi
           }
 
@@ -662,7 +719,8 @@ jobs:
             local a
             for a in "$@"; do
               echo "  上传 ${a} ($(du -h "${DL_DIR}/${a}" | cut -f1)) …"
-              "${AWS[@]}" cp "${DL_DIR}/${a}" "${S3}/${tag}/${a}" --only-show-errors
+              "${AWS[@]}" cp "${DL_DIR}/${a}" "${S3}/${tag}/${a}" \
+                --cache-control "$CACHE_IMMUTABLE" --only-show-errors
               printf '%s\t%s\n' "$a" "${URL_BASE}/${tag}/${a}" >> "$ASSET_URL_FILE"
               echo "  ✓ ${a}"
             done
@@ -681,7 +739,8 @@ jobs:
             for f in $MIRROR_REPO_FILES; do
               [ -f "${REPO_ROOT}/${f}" ] \
                 || { mwarn "${PLATFORM_NAME}: 本仓库没有 ${f}，跳过"; continue; }
-              "${AWS[@]}" cp "${REPO_ROOT}/${f}" "${S3}/${ns}/${f}" --only-show-errors
+              "${AWS[@]}" cp "${REPO_ROOT}/${f}" "${S3}/${ns}/${f}" \
+                --cache-control "$CACHE_MUTABLE" --only-show-errors
               echo "  ✓ ${ns}/${f}"
             done
             [ "$1" = full ] || return 0
@@ -690,7 +749,8 @@ jobs:
             # 它给 CADDY_TAG_FILE 用，配合 CADDY_REL_BASE 能装任意还保留着的旧版本，
             # 而清单只指向最新一版。
             printf '%s\n' "$TAG" > "${MIRROR_TMPD}/latest.txt"
-            "${AWS[@]}" cp "${MIRROR_TMPD}/latest.txt" "${S3}/latest.txt" --only-show-errors
+            "${AWS[@]}" cp "${MIRROR_TMPD}/latest.txt" "${S3}/latest.txt" \
+              --cache-control "$CACHE_MUTABLE" --only-show-errors
             echo "  ✓ latest.txt"
 
             # 清单和 README 里都会写满绝对地址，没有公开域名就别生成 ——
@@ -699,9 +759,11 @@ jobs:
               echo "  （未配置公开域名，跳过 manifest.txt / README.md）"
               return 0
             fi
-            "${AWS[@]}" cp "$MANIFEST_LOCAL" "${S3}/${ns}/${MANIFEST_PATH}" --only-show-errors
+            "${AWS[@]}" cp "$MANIFEST_LOCAL" "${S3}/${ns}/${MANIFEST_PATH}" \
+              --cache-control "$CACHE_MUTABLE" --only-show-errors
             render_readme > "${MIRROR_TMPD}/README.md"
-            "${AWS[@]}" cp "${MIRROR_TMPD}/README.md" "${S3}/${ns}/README.md" --only-show-errors
+            "${AWS[@]}" cp "${MIRROR_TMPD}/README.md" "${S3}/${ns}/README.md" \
+              --cache-control "$CACHE_MUTABLE" --only-show-errors
             echo "  ✓ ${ns}/${MANIFEST_PATH} / ${ns}/README.md"
           }
 
