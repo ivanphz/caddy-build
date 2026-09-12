@@ -1,0 +1,72 @@
+name: Contract Selftest
+
+# CONTRACT.md 的可执行版本。改了 install.sh 就跑一遍。
+#
+# 刻意不挂在 build.yml 里：build 只在 go.mod / go.sum 变更时触发，
+# 而契约行为的变更通常只动 install.sh —— 挂错地方等于永远不跑。
+#
+# 不需要网络（清单走 file://）、不需要 root、不碰真实系统目录，
+# 所以几秒就完事，可以放心挂在每个 PR 上。
+
+on:
+  push:
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/contract-selftest.sh'
+      - 'CONTRACT.md'
+  pull_request:
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/contract-selftest.sh'
+      - 'CONTRACT.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run contract selftest
+        run: bash scripts/contract-selftest.sh scripts/install.sh
+
+      # 一套在任何代码上都通过的测试什么都没测。
+      # 这里把 install.sh 的关键行为逐个打断，确认对应用例真的会红 ——
+      # 实测逼出过一个空档：K/L 走的都是「清单」那条路，
+      # 给 latest_tag 加回 2>/dev/null 仍然全绿，于是补了 L2。
+      - name: Verify the selftest can fail
+        run: |
+          set -euo pipefail
+          orig="$(mktemp)"; cp scripts/install.sh "$orig"
+          restore() { cp "$orig" scripts/install.sh; }
+          trap restore EXIT
+
+          mutate() {   # <说明> <原文> <替换>
+            restore
+            python3 - "$2" "$3" <<'PY'
+          import sys
+          p='scripts/install.sh'; s=open(p,encoding='utf-8').read()
+          a,b=sys.argv[1],sys.argv[2]
+          assert s.count(a)==1, f"变异锚点不唯一/不存在: {a[:60]}"
+          open(p,'w',encoding='utf-8').write(s.replace(a,b))
+          PY
+            if bash scripts/contract-selftest.sh scripts/install.sh >/dev/null 2>&1; then
+              echo "::error::打断了「$1」之后自测仍然全绿 —— 这条行为没有被任何用例覆盖"
+              return 1
+            fi
+            echo "  ✓ 打断「$1」→ 自测变红"
+          }
+
+          mutate 'manifest_contract 无条件输出' \
+            '  printf '"'"'manifest_contract=%s\n'"'"' "${mc:-none}"' \
+            '  if [ -n "$MANIFEST" ]; then printf '"'"'manifest_contract=%s\n'"'"' "$mc"; fi'
+
+          mutate 'latest_tag 的诊断不被吞' \
+            '    lt="$(latest_tag)" || lt=""' \
+            '    lt="$(latest_tag 2>/dev/null)" || lt=""'
+
+          restore
+          echo "全部变异都被抓住"
