@@ -1,7 +1,7 @@
 # 下游消费契约
 
 本仓库对**自动化消费者**（脚本、舰队编排）的承诺。面向人类的用法看
-[`README.md`](README.md)。
+[`docs/install.md`](docs/install.md)。
 
 契约的核心是一句话：**消费者永远只查清单，不拼 URL。**
 
