@@ -6,6 +6,10 @@
 #   更新:   sudo caddy-update
 #   卸载:   sudo caddy-update uninstall
 #
+# 自动化消费者（见 CONTRACT.md）：
+#   install.sh --check              只探测不安装，输出 key=value，退出码 0/1/3
+#   install.sh --contract-version   打印契约版本号
+#
 # 环境变量:
 # 下载来源（两类资源分开配，因为 URL 形状不同）:
 #   GH_MIRROR=https://ghfast.top/   前缀型代理，同时作用于两类资源
@@ -32,6 +36,13 @@
 #   WELCOME=0                       不部署默认欢迎页（Caddyfile 仍用官方那份，根路径返回 404）
 #
 set -euo pipefail
+
+# 下游消费契约的版本号。这一行是全仓唯一真源 —— mirror-lib.sh 和 build.yml
+# 都用 awk 从这里抠，不要在别处再写一遍。
+# 语义（详见 CONTRACT.md）：
+#   加资产、加清单行、改 URL                        → 不变
+#   删/改已有清单键的含义、改环境变量语义、改退出码 → +1
+CONTRACT_VERSION=1
 
 REPO="${CADDY_REPO:-ivanphz/caddy-build}"
 REF="${CADDY_REF:-main}"
@@ -143,6 +154,7 @@ repo_fetch() {   # $1=仓库内相对路径 $2=落盘路径
 #   caddy-linux-amd64.sha256  https://.../download/caddy-linux-amd64.sha256
 # 用纯文本而非 JSON，是为了不给脚本引入 jq 依赖 —— 全程只用 curl/awk/sed。
 fetch_manifest() {
+  local head_key
   [ -n "$MANIFEST" ] || return 1
   if [ -z "$MANIFEST_CACHE" ]; then
     MANIFEST_CACHE="$(mktemp)"
@@ -150,6 +162,15 @@ fetch_manifest() {
       || die "无法拉取清单: $MANIFEST"
     tr -d '\r' < "$MANIFEST_CACHE" > "${MANIFEST_CACHE}.clean" \
       && mv -f "${MANIFEST_CACHE}.clean" "$MANIFEST_CACHE"
+
+    # 软 404 防线：有平台（实测 CNB）对不存在的路径返回 HTTP 200 + 一张 HTML
+    # 错误页，curl -f 完全拦不住。清单是 TSV，首行的键只可能是下面这几个；
+    # 拿到 '<!DOCTYPE' 就当场说清楚，而不是让后面的查表一个个报「缺少 xxx」。
+    head_key="$(awk -F'\t' 'NR==1{print $1; exit}' "$MANIFEST_CACHE")"
+    case "$head_key" in
+      contract|tag|install_sh) ;;
+      *) die "清单内容不像清单（首行键是 '${head_key}'）。多半取到了平台的 HTML 错误页 —— 有的平台软 404 会返回 HTTP 200: $MANIFEST" ;;
+    esac
   fi
   printf '%s' "$MANIFEST_CACHE"
 }
@@ -177,8 +198,23 @@ rel_url() {
 
 # 用清单时的一次性前置校验。放在主流程里（不在子 shell 里）才能真的 die。
 verify_manifest() {
-  local mtag arch asset a
+  local mtag arch asset a mc
   [ -n "$MANIFEST" ] || return 0
+
+  # 先在主流程里拉一次：fetch_manifest 里的内容校验要能真的 die。
+  # 放任它在 $(manifest_get …) 的子 shell 里 die，只会杀掉子 shell，
+  # 主流程带着空值继续跑，最后报一个跟真正原因不相干的错。
+  fetch_manifest >/dev/null
+
+  # 契约版本。没有这一行 = 契约诞生前的老清单，按 1 处理。
+  mc="$(manifest_get contract 2>/dev/null)" || mc=""
+  mc="${mc:-1}"
+  case "$mc" in
+    ''|*[!0-9]*) die "清单的 contract 值不是整数: '${mc}'" ;;
+  esac
+  [ "$mc" -le "$CONTRACT_VERSION" ] \
+    || die "清单声明 contract=${mc}，本脚本只支持到 ${CONTRACT_VERSION}。上游做了破坏性变更，请先更新 install.sh —— 继续装很可能装出不符合预期的结果。"
+
   mtag="$(manifest_get tag)" || die "清单里缺少 tag 行: $MANIFEST"
   # 清单是「某一个版本」的地址表，不是全量索引。CADDY_TAG 指向别的版本时必须
   # 停下来 —— 否则会出现「日志说在装 A、实际下载的是 B、状态文件记成 A」
@@ -620,6 +656,64 @@ do_uninstall() {
   info "配置和数据保留在 $CONF_DIR / $DATA_DIR / $SITE_DIR，确认不需要后手动删除。"
 }
 
+# 只探测，不动机器。给舰队编排扫「谁该升级」用。
+#
+# stdout 只有 key=value 行 —— 诊断信息一律走 stderr，调用方可以直接按 = 切。
+#
+# 退出码是这个子命令契约的一部分：
+#   0  探测成功（不管有没有新版本）
+#   1  探测失败：拿不到最新版本号（网络不通 / 清单坏了 / 源地址错）
+#   3  本机没装 caddy
+#
+# 「有新版本」绝不用非零表达 —— --check 回答的是问句不是命令，
+# 混在一起会让调用方分不清「有更新」和「探测失败」，
+# 而这两件事在 33 台机器的扫描结果里是完全不同的处理方式。
+# 3 单独分出来是因为「没装」对舰队审计是个正常结论，不该和真故障混为一谈。
+do_check() {
+  local cur="" lt="" active ec=0
+
+  if [ -x "$BIN_PATH" ]; then
+    cur="$(installed_tag)"
+    [ -n "$cur" ] || cur=unknown     # 装了但没状态文件
+  fi
+
+  # 这里不能 die：探测不到要能说出「探测不到」，而不是整个脚本退场。
+  #
+  # 必须写成 `x="$(f)" || x=""`，【不能】写 `x="$(f || true)"`：
+  # latest_tag 失败时走的是 die → exit，exit 直接结束子 shell，
+  # 子 shell 里的 || true 根本没机会执行；命令替换于是返回非零，
+  # errexit 把整个脚本带走 —— 表现是 --check 一行不输出就退出码 1。
+  # || 必须放在父层才拦得住。
+  if [ -n "$TAG" ]; then
+    lt="$TAG"
+  else
+    lt="$(latest_tag 2>/dev/null)" || lt=""
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    active=unknown
+  elif systemctl is-active --quiet caddy 2>/dev/null; then
+    active=yes
+  else
+    active=no
+  fi
+
+  printf 'contract=%s\n' "$CONTRACT_VERSION"
+  printf 'current=%s\n'  "${cur:-none}"
+  printf 'latest=%s\n'   "${lt:-unknown}"
+  if [ -z "$lt" ]; then
+    printf 'would_change=unknown\n'; ec=1
+  elif [ -z "$cur" ]; then
+    printf 'would_change=yes\n'; ec=3
+  elif [ "$cur" = "$lt" ]; then
+    printf 'would_change=no\n'
+  else
+    printf 'would_change=yes\n'
+  fi
+  printf 'service_active=%s\n' "$active"
+  return "$ec"
+}
+
 do_status() {
   local cv it lt
   cv="$(caddy_version)"; it="$(installed_tag)"; lt="$(latest_tag)"
@@ -647,8 +741,11 @@ case "${1:-install}" in
     ;;
   uninstall|remove) do_uninstall ;;
   status)           do_status ;;
+  # 下面两个给自动化消费者用，不改动机器。见 CONTRACT.md。
+  --check|check)    do_check ;;
+  --contract-version) printf '%s\n' "$CONTRACT_VERSION" ;;
   -h|--help|help)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "未知子命令: $1（可用: install / update / uninstall / status）" ;;
+  *) die "未知子命令: $1（可用: install / update / uninstall / status / --check / --contract-version）" ;;
 esac

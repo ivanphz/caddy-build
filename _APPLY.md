@@ -1,24 +1,20 @@
 # 应用说明
 
-这个包按仓库结构组织，**直接把内容覆盖到 caddy-build 仓库根目录即可**。
-所有文件都是完整版本，不是补丁。
+按结构覆盖到仓库根目录。全部是完整文件，不是补丁。
 
 ```
-README.md                          改（4 处事实错误 + 镜像安装命令 + Variables 表）
-mirror/README.md                   改（改用清单安装）
-.github/workflows/build.yml        改（R2 job 移出；接入 mirror；重试与三态基准）
-.github/workflows/mirror.yml       新（由 mirror_cn.yml 更名而来，并入 R2）
-.github/workflows/README.md        新（workflow 总览）
-scripts/install.sh                 改
-scripts/bench-mirror.sh            改
-scripts/release_notes.py           改
-scripts/mirror-lib.sh              新
-scripts/ci-lib.sh                  新
+CONTRACT.md                        新（下游消费契约）
+docs/ROADMAP.md                    新（待开发）
+README.md                          改（--check / --contract-version、仓库结构）
+mirror/README.md                   未变
+.github/workflows/build.yml        改（清单头 + 清单发到 Release）
+.github/workflows/mirror.yml       未变
+.github/workflows/README.md        未变
+scripts/install.sh                 改（CONTRACT_VERSION / --check / --contract-version / 清单内容校验）
+scripts/mirror-lib.sh              改（清单加 contract + install_sh 行）
+scripts/ci-lib.sh                  未变
+scripts/bench-mirror.sh            未变
+scripts/release_notes.py           未变
 ```
 
-**需要手动删除的文件**（覆盖操作不会帮你删）：
-
-```
-.github/workflows/mirror_cn.yml    ← 已更名为 mirror.yml，必须删掉旧的，
-                                     否则两个 workflow 会同时抢镜像
-```
+无需删除任何文件。

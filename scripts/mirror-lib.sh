@@ -339,12 +339,27 @@ upload_order() {
 #
 # 好处是它对【任何】平台都成立：以后接新平台，只要适配器能报出真实下载地址，
 # 安装侧一行都不用改。
+# 契约版本号的唯一真源是 scripts/install.sh 里那一行。从文件里抠，
+# 不在这里再写一遍 —— 两处各写一个数字，迟早会对不上。
+contract_version() {
+  awk '/^CONTRACT_VERSION=/{sub(/^CONTRACT_VERSION=/,""); sub(/[^0-9].*$/,""); print; exit}' \
+      "${REPO_ROOT}/scripts/install.sh"
+}
+
 write_manifest() {
+  local cv
+  cv="$(contract_version)"
+  [ -n "$cv" ] || mdie "从 scripts/install.sh 读不到 CONTRACT_VERSION"
   {
+    printf 'contract\t%s\n' "$cv"
     printf 'tag\t%s\n' "$TAG"
+    # install_sh 指向【本镜像自己】的地址，不指回 GitHub。
+    # 清单解决的是「拼不出 URL」，但国内机器拿到清单后下一跳还要能下得动 ——
+    # 指回 GitHub 等于把问题留在最后一米。
+    printf 'install_sh\t%s\n' "${RAW_BASE}/scripts/install.sh"
     sort "$ASSET_URL_FILE"
   } > "$MANIFEST_LOCAL"
-  mlog "清单: $(wc -l < "$MANIFEST_LOCAL") 行"
+  mlog "清单: $(wc -l < "$MANIFEST_LOCAL") 行（contract=${cv}）"
 }
 
 # ---- 推仓库 -----------------------------------------------------------------
@@ -646,7 +661,9 @@ mirror_run() {
   if [ "${PLATFORM_PUBLIC_URLS:-1}" = 1 ]; then
     probe_raw_base
     if [ "${RAW_BASE_CHANGED:-0}" = 1 ]; then
-      mlog "用新基址重新生成 README 再推一次"
+      # 清单里的 install_sh 也是从 RAW_BASE 拼的，基址变了必须一起重写
+      mlog "用新基址重新生成 README 和清单再推一次"
+      write_manifest
       sync_repo "$MIRROR_BRANCH" full
     fi
   fi

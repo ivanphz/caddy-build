@@ -40,7 +40,24 @@ sudo caddy-update status                    # 看当前版本 / 最新版本 / �
 sudo caddy-update uninstall                 # 卸载二进制和服务（保留配置与数据）
 sudo CADDY_TAG=v2.11.4-20260807.1930 caddy-update  # 装/回退到指定版本
 sudo NO_SERVICE=1 caddy-update              # 只更新二进制，不碰 systemd
+
+caddy-update --check                        # 只探测不安装，输出 key=value
+caddy-update --contract-version             # 打印下游契约版本号
 ```
+
+后两个是给自动化编排用的，不动机器、不需要 root：
+
+```
+$ caddy-update --check
+contract=1
+current=v2.11.3-20260701.0900
+latest=v2.11.4-20260813.1110
+would_change=yes
+service_active=yes
+```
+
+退出码 `0` = 探测成功（不管有没有新版本），`1` = 探测失败，`3` = 没装。
+完整约定见 [`CONTRACT.md`](CONTRACT.md)。
 
 ### 完整卸载
 
@@ -740,7 +757,9 @@ dist/UPSTREAM.md                   同步来源与上游 commit 记录
 mirror/README.md                   镜像仓库用的精简 README 模板
                                    （占位符由 mirror.yml 按平台替换）
 
-scripts/install.sh                 安装 / 更新 / 卸载
+CONTRACT.md                        下游消费契约（给脚本看的）
+docs/ROADMAP.md                    待开发
+scripts/install.sh                 安装 / 更新 / 卸载 / 探测
 scripts/release_notes.py           Release 正文生成
 scripts/mirror-lib.sh              分发流程（平台无关），被 mirror.yml source
 scripts/ci-lib.sh                  CI 共用小工具（目前只有网络重试）
