@@ -69,7 +69,7 @@ jobs:
       R2_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve tag & download assets
         id: resolve
@@ -134,7 +134,7 @@ jobs:
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' && env.GITEE_TOKEN != '' }}
         env:
           TOKEN: ${{ secrets.GITEE_TOKEN }}
-          OWNER_REPO: ${{ vars.GITEE_REPO }}      # 例: ivanabc/caddy-build
+          OWNER_REPO: ${{ vars.GITEE_REPO }}      # 例: <owner>/caddy-build
           # 留空 = 传全部。跨境上传 68MB 到 Gitee 实测走不通时，可以设成
           # 只传校验和（例: "caddy-linux-amd64.sha256 caddy-linux-arm64.sha256"），
           # 让 Gitee 只承担 install.sh + README 的分发。
@@ -404,7 +404,7 @@ jobs:
         if: ${{ !cancelled() && steps.resolve.outcome == 'success' && env.CNB_TOKEN != '' }}
         env:
           TOKEN: ${{ secrets.CNB_TOKEN }}         # 需要 repo-release:rw 权限
-          OWNER_REPO: ${{ vars.CNB_REPO }}        # 例: ivanabc/caddy-build
+          OWNER_REPO: ${{ vars.CNB_REPO }}        # 例: <owner>/caddy-build
           ONLY: ${{ vars.CNB_ASSETS }}            # 留空 = 传全部
           BRANCH: ${{ vars.CNB_BRANCH }}          # 留空则自动探测远端默认分支
           # 直接指定 raw 基址（{BRANCH} 会被替换）。留空则从候选里逐个探测。

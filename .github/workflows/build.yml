@@ -33,7 +33,7 @@ jobs:
       build_time: ${{ steps.ver.outputs.time }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 版本号只在这里生成一次，两个架构共用，避免跨分钟产生不同 tag。
       #
@@ -85,10 +85,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           check-latest: true
@@ -236,7 +236,7 @@ jobs:
 
       # 二进制 + 校验和：两个架构都有
       - name: Upload Binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: caddy-${{ matrix.goarch }}
           if-no-files-found: error
@@ -247,7 +247,7 @@ jobs:
       # 元数据：只有 amd64 有，单独上传避免 arm64 刷 warning
       - name: Upload Metadata
         if: matrix.goarch == 'amd64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: metadata
           if-no-files-found: error
@@ -262,7 +262,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 
@@ -272,6 +272,25 @@ jobs:
       #
       # 资产行直接从下载回来的产物生成：构建出什么就写什么，
       # 不维护第二份文件名单。
+      # download-artifact 从 v4 跨到 v7，官方明确改过「单产物下载的落盘路径」。
+      # 我们后面每一步都依赖 artifacts/<产物名>/<文件> 这个结构，先断言一次 ——
+      # 不然结构一变，报错会出现在三步之后的 cp 或 wc 上，指不到真正的原因。
+      - name: Verify Artifact Layout
+        run: |
+          set -euo pipefail
+          echo "--- 实际结构 ---"; find artifacts -maxdepth 2 | sort
+          miss=""
+          for d in caddy-amd64 caddy-arm64 metadata; do
+            [ -d "artifacts/${d}" ] || miss="${miss} artifacts/${d}"
+          done
+          for f in metadata/manifest_head.txt metadata/final_note.md; do
+            [ -f "artifacts/${f}" ] || miss="${miss} artifacts/${f}"
+          done
+          [ -z "$miss" ] || {
+            echo "::error::产物结构不符合预期，缺:${miss}。多半是 download-artifact 大版本升级改了落盘路径。"
+            exit 1; }
+          echo "✓ 结构正确"
+
       - name: Generate Manifest
         env:
           TAG: ${{ needs.init.outputs.version_tag }}
@@ -314,7 +333,7 @@ jobs:
           cat body.md
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.init.outputs.version_tag }}
           name: ${{ needs.init.outputs.version_tag }}
