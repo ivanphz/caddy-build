@@ -379,6 +379,17 @@ jobs:
           [ -n "$url" ] || { echo "::error::清单里没有 install_sh 行"; exit 1; }
           echo "校验: $url"
 
+          # install_sh 必须钉在 tag 上，不能指向分支。
+          #
+          # 这条约束以前只写在交付说明里 —— 而交付说明是临时文件，看完就没了。
+          # 结果是：漏掉这条改动时，清单照样生成、CI 照样全绿、什么都不报，
+          # 只是地址悄悄退回分支。约束要写进代码才拦得住，写进文档只是希望。
+          case "$url" in
+            *"/${TAG}/"*) ;;
+            *) echo "::error::清单里的 install_sh 没有钉 tag: ${url}。指向分支意味着这份不可变的清单里塞了一个活动引用 —— 往分支推一个坏的 install.sh，所有按清单消费的机器下一次全都坏，而且没有回滚路径。"
+               exit 1 ;;
+          esac
+
           # curl 的 --retry 不重试 404，而这里要等的恰恰是
           # raw.githubusercontent.com 对刚创建的 tag 的传播窗口。自己循环。
           probe=/tmp/probe_install.sh

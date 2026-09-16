@@ -23,6 +23,7 @@
 | `build.yml` | Build Custom Caddy | `go.mod` / `go.sum` 变更、手动 | 编译 amd64 + arm64、冒烟测试、生成 release notes、发 Release、清理旧 Release、（可选）推 R2 | GitHub Release + R2 |
 | `sync_dist.yml` | Sync dist assets | 每周一 18:00、手动 | 从 `caddyserver/dist` 拉默认 Caddyfile 和欢迎页 | 提交回本仓库 `dist/` |
 | `mirror.yml` | Mirror | 由 `build.yml` 自动调用，也可手动 | 把 Release 的 4 个资产 + `install.sh` + `manifest.txt` 分发到 Gitee / CNB / R2 | 各平台仓库、Release、存储桶 |
+| `selftest.yml` | Contract Selftest | 改 `install.sh` / 自测脚本 / `CONTRACT.md` 时，以及 PR | 跑 `contract-selftest.sh`（20 条断言），再跑 `contract-mutation-check.sh` 确认自测本身有效 | 只有红绿 |
 | `dependabot.yml` | — | 每月 | 只跟 Actions 版本，**不管 Go 依赖**（那是 `update_deps` 的活） | PR |
 
 ---
@@ -149,14 +150,27 @@ echo $?                                          # → 141
 同类写法还有 `aws s3 ls … | grep -q .`（前缀明明存在却判为不存在）、
 `curl … | head -n1`（内容取到了却走进 die）。
 
-**规则：`pipefail` 下不要把 `head` / `grep -q` / `sed …q` 这类会提前关闭读端的命令
-放在管道末尾。** 先整个取回变量，再用 bash 参数展开处理：
+**判据不是「有没有用管道」，是「这条管道的退出码参不参与判断」。**
+`die "…$(echo "$resp" | head -c 400)"` 安全——那是字符串参数，退出码没人看；
+`if printf … | grep -q …` 不安全。
+
+**规则：退出码要被用到的管道，末尾不要放 `head` / `grep -q` / `sed …q`
+这类会提前关闭读端的命令。** 先整个取回变量，再用参数展开或 here-string：
 
 ```bash
 body="$(curl -sSL "$url")"
 first="${body%%$'\n'*}"
 case "$first" in '#!'*) ;; *) echo 不是脚本 ;; esac
+
+grep -q "$pat" <<< "$var"      # 断言用 here-string：不产生独立的写入进程
 ```
+
+> **测试代码要和生产代码守同一套规矩。** 前两次都是在生产代码里发现的，
+> 第三次还是漏在了自测脚本上——测试代码天然比生产代码少受审视。
+> 实测 4000 次里假失败 3 次；一个 flaky 的检查最终下场是被加 `|| true`，
+> 然后它保护的东西就再也没人管了。
+>
+> 完整的坑清单见 [docs/TRAPS.md](../../docs/TRAPS.md)。
 
 ### 软 404
 
