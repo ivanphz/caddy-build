@@ -60,8 +60,11 @@ docs/mirrors.md                    Gitee / CNB / R2 的配置与排障
 docs/plugins.md                    插件清单与增删
 docs/build.md                      ← 本文
 docs/design.md                     设计取舍
+docs/TRAPS.md                      踩过的坑（改代码前扫一眼）
 docs/ROADMAP.md                    待开发
 scripts/install.sh                 安装 / 更新 / 卸载 / 探测
+scripts/contract-selftest.sh       CONTRACT.md 的可执行版本，20 条断言
+scripts/contract-mutation-check.sh 验证自测本身有效（四条变异）
 scripts/release_notes.py           Release 正文生成
 scripts/mirror-lib.sh              分发流程（平台无关），被 mirror.yml source
 scripts/ci-lib.sh                  CI 共用小工具（目前只有网络重试）
@@ -72,6 +75,7 @@ scripts/bench-mirror.sh            镜像链路测速，选中转机用（不参
 .github/workflows/build.yml        编译与发布
 .github/workflows/sync_dist.yml    从 caddyserver/dist 同步打包资产
 .github/workflows/mirror.yml       分发到 Gitee / CNB / R2（由 build.yml 调用）
+.github/workflows/selftest.yml     契约自测 + 变异检测
 .github/dependabot.yml             Actions 版本自动跟进（不管 Go 依赖）
 .gitattributes                     强制 LF，防 CRLF 混入 plugins.txt
 ```

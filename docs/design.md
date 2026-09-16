@@ -13,6 +13,7 @@
 | 为什么镜像不同步插件清单，以及这么做的局限 | [mirrors.md · 镜像里放了什么](mirrors.md#镜像里放了什么没放什么) |
 | 为什么用清单而不是拼 URL；`--check` 的退出码为什么这么分 | [CONTRACT.md](../CONTRACT.md) |
 | `pipefail` + `head`/`grep -q` 的坑、软 404 | [.github/workflows/README.md](../.github/workflows/README.md) |
+| 这个仓库真实踩过的全部坑（含复现数据） | [TRAPS.md](TRAPS.md) |
 
 ## 为什么不把日期拼进 caddy version
 

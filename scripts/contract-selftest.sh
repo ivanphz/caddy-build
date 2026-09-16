@@ -17,6 +17,16 @@
 # =============================================================================
 set -uo pipefail        # 【刻意不设 -e】：测试要跑完全部用例再汇总，不能中途退场
 
+# 【断言一律用 grep -q <<< "$var"，不要用 printf … | grep -q】
+# pipefail 下 `printf '%s\n' "$out" | grep -qxF "$kv"` 会【随机】假失败：
+# grep -q 首次命中就退出 → printf 还没写完就吃 SIGPIPE(141) → pipefail
+# 判整条管道失败 → 明明命中却记成「缺少」。命中在第一行时最容易触发。
+# 实测 4000 次里假失败 3 次，换成 here-string 后 0 次。
+#
+# 这条本仓库在生产代码里已经栽过两次（aws ls | grep -q .、curl | head -n1），
+# 却还是漏在了测试代码上 —— 测试代码天然比生产代码少受审视。
+# 一个 flaky 的检查最终下场是被加 `|| true`，然后它保护的东西就再也没人管了。
+
 I="${1:-scripts/install.sh}"
 [ -f "$I" ] || { echo "找不到 install.sh: $I" >&2; exit 2; }
 I="$(cd "$(dirname "$I")" && pwd)/$(basename "$I")"
@@ -72,7 +82,7 @@ check() {
         out="$(env CADDY_BIN="$BIN" CADDY_CONF_DIR="$STATE_DIR" CADDY_MANIFEST="$man" bash "$I" --check 2>"$W/err")"; rc=$?
     fi
     for kv in "$@"; do
-        printf '%s\n' "$out" | grep -qxF "$kv" || miss="$miss [$kv]"
+        grep -qxF "$kv" <<< "$out" || miss="$miss [$kv]"
     done
     if [ "$rc" != "$want_rc" ]; then
         bad "$desc" "rc=$rc（期望 $want_rc）; 输出: $(printf '%s' "$out" | tr '\n' ' ')"
@@ -129,7 +139,7 @@ check "H2 清单设了但读不出来 → unknown（不是 none）" 1 "$(M soft4
 # 用 CADDY_TAG 短路版本探测：没设 MANIFEST 时 --check 本来会真的去问 GitHub，
 # 结果取决于当时的网络和线上版本。断言里混进环境依赖等于埋一个随机失败的用例。
 out="$(env CADDY_BIN="$BIN" CADDY_CONF_DIR="$STATE_DIR" CADDY_TAG=v0.0.0 bash "$I" --check 2>/dev/null)"
-printf '%s\n' "$out" | grep -qxF "manifest_contract=none" \
+grep -qxF "manifest_contract=none" <<< "$out" \
   && ok "J 没设 MANIFEST 时键仍出现（条件出现的键是坑）" \
   || bad "J 没设 MANIFEST 时键仍出现" "实得: $(printf '%s' "$out" | tr '\n' ' ')"
 
@@ -159,7 +169,7 @@ grep -q '版本指针' "$W/e3" 2>/dev/null \
 grp "④ 安装路径的契约检查（不实际安装，只看拒绝行为）"
 one() { # one <说明> <清单> <期望 stderr 关键字>
     local o; o="$(env CADDY_BIN="$BIN" CADDY_CONF_DIR="$STATE_DIR" CADDY_MANIFEST="$2" bash "$I" install 2>&1)"
-    printf '%s' "$o" | grep -q "$3" && ok "$1" || bad "$1" "stderr 里找不到「$3」：$(printf '%s' "$o" | head -2 | tr '\n' ' ')"
+    grep -q "$3" <<< "$o" && ok "$1" || bad "$1" "stderr 里找不到「$3」：$(printf '%s' "$o" | head -2 | tr '\n' ' ')"
 }
 one "M contract=99 拒装"          "$(M c99.txt)"   "只支持到"
 one "N contract 非整数报错"        "$(M cbad.txt)"  "不是整数"
@@ -178,7 +188,7 @@ cv="$(awk '/^CONTRACT_VERSION=/{sub(/^CONTRACT_VERSION=/,""); sub(/[^0-9].*$/,""
 [ "$cv" = "1" ] && ok "Q awk 抠取抗注释干扰" || bad "Q awk 抠取" "实得 '$cv'（被注释里的数字串了）"
 
 out="$(env CADDY_BIN="$BIN" CADDY_CONF_DIR="$STATE_DIR" CADDY_MANIFEST="$(M ok.txt)" bash "$I" --check 2>/dev/null)"
-printf '%s\n' "$out" | grep -qvE '^[a-z_]+=[^=]*$' \
+grep -qvE '^[a-z_]+=[^=]*$' <<< "$out" \
   && bad "R stdout 只有 key=value 行" "混进了别的内容" \
   || ok "R stdout 只有 key=value 行"
 

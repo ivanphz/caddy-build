@@ -51,6 +51,7 @@ CNB、R2 两条路和换源的完整说明见 [docs/install.md](docs/install.md)
 | 知道编进了哪些插件，或增删插件 | [docs/plugins.md](docs/plugins.md) |
 | 改这条构建流水线 | [docs/build.md](docs/build.md) |
 | 搞清楚某个写法为什么是这样 | [docs/design.md](docs/design.md) |
+| 改代码前想知道有哪些坑 | [docs/TRAPS.md](docs/TRAPS.md) |
 | 用脚本消费这个仓库（舰队编排等） | [CONTRACT.md](CONTRACT.md) |
 | 知道每个 workflow 干什么、要哪些 Secret | [.github/workflows/README.md](.github/workflows/README.md) |
 | 看还有什么没做 | [docs/ROADMAP.md](docs/ROADMAP.md) |

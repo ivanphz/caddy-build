@@ -240,4 +240,7 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 | 2026-09 | 文档按读者角色拆成 6 份，README 从 974 行减到 85 行 |
 | 2026-09 | `--check` 补上清单契约校验与 stderr 诊断；GitHub 清单的 `install_sh` 钉到 tag |
 | 2026-09 | 安装路径五个目录全部可覆盖；新增 `NO_HELPER=1` |
+| 2026-09 | 自测的 flaky 修掉（`printf \| grep -q` → here-string），60 轮 0 假红 |
+| 2026-09 | `install_sh` 必须钉 tag 变成 `build.yml` 里的断言，不再只是文档约定 |
+| 2026-09 | `docs/TRAPS.md`：把踩过的坑连同复现数据集中成一份 |
 | 2026-09 | `scripts/contract-selftest.sh`（19 条断言）+ CI 变异检测；镜像内容一致性绊线 |
