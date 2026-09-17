@@ -2,6 +2,20 @@
 
 按「不做的代价」排，不按工作量排。做完划掉并注明日期。
 
+> **2026-09 定档，影响 #2 / #4 / #6 —— 动镜像侧代码之前先看这一段。**
+>
+> `mirror.yml` 这一整套（Gitee / CNB / R2 分发）要迁出到一个独立的私有分发库
+> （草稿名 dray），迁完之后本仓库删掉 `mirror.yml`。所以：
+>
+> - 迁移前 `mirror.yml` 照常运行、坏了照常修，但**不要在它上面加新功能**
+> - #2 的**服务端** transport 层、#6 的测速改进，做在迁移后的新位置；
+>   #2 的**客户端**部分（`install.sh` 的命名源）不受影响，仍在这里
+> - #4 在本仓库只做 GHCR；国内 registry 的推送同样归分发库
+> - 迁移顺序**先切消费方、后删 `mirror.yml`**，反过来墙内节点会在下一次发版时静默断更。
+>   完整步骤见 assay 设计包里的 `caddy-build/docs/ASSAY-INTEGRATION.md`
+>
+> 本仓库的公开构建、公开 Release、`manifest.txt` 与 `CONTRACT.md` 都不因此改变。
+
 ---
 
 ## 1. 架构与资产名的单一真源
@@ -244,3 +258,6 @@ amd64 + arm64 直接塞已经编好的二进制进去，不要在镜像里重新
 | 2026-09 | `install_sh` 必须钉 tag 变成 `build.yml` 里的断言，不再只是文档约定 |
 | 2026-09 | `docs/TRAPS.md`：把踩过的坑连同复现数据集中成一份 |
 | 2026-09 | `scripts/contract-selftest.sh`（19 条断言）+ CI 变异检测；镜像内容一致性绊线 |
+| 2026-09 | `build.yml` 发版校验步骤补上自己的 `TAG`（原先引用的是另一个 step 的 env，下一次发版必红）；空 `TAG` 不再让钉 tag 断言恒真 |
+| 2026-09 | `scripts/lint-workflow-env.py` 挂进 `selftest.yml`：查跨 step 失效的 env 引用；自测连跑 100 轮 0 假红（对照组改回 `printf \| grep -q` 后 120 轮红 2 次） |
+| 2026-09 | `docs/HANDOFF-NEW-CHAT.md`：新开对话的交接进仓库，不再只活在聊天记录里 |

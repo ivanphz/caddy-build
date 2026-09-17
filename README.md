@@ -55,6 +55,7 @@ CNB、R2 两条路和换源的完整说明见 [docs/install.md](docs/install.md)
 | 用脚本消费这个仓库（舰队编排等） | [CONTRACT.md](CONTRACT.md) |
 | 知道每个 workflow 干什么、要哪些 Secret | [.github/workflows/README.md](.github/workflows/README.md) |
 | 看还有什么没做 | [docs/ROADMAP.md](docs/ROADMAP.md) |
+| 新开一轮 AI 对话接着做 | [docs/HANDOFF-NEW-CHAT.md](docs/HANDOFF-NEW-CHAT.md)（整份贴进去） |
 
 ---
 

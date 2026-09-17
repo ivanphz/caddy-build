@@ -144,6 +144,39 @@ Gitee 公开仓库的 raw 数据在服务端缓存 60~300 秒，而且**不同�
 
 ---
 
+## 9. step 级 `env` 不跨 step —— 而本地模拟正好把它盖住
+
+上一条那个断言，合进 `main` 时自己就是坏的：它在「Verify manifest install_sh
+is reachable」里引用 `TAG`，而 `TAG` 只写在前一个 step「Generate Manifest」的
+`env:` 下。**step 级 env 只对那一个 step 生效**，到下一个 step 就是「未设置」：
+
+| 脚本 | 表现 |
+| :--- | :--- |
+| 开了 `set -u`（这里就是） | `TAG: unbound variable`，step 红 |
+| 没开 `set -u` | 展开成空串，`*"/${TAG}/"*` 退化成 `*"//"*` —— 任何 https 地址都匹配，**断言恒真** |
+
+上线前实测过「钉了 tag 放行、退回分支拦下」，全对 —— 因为模拟时**先手工
+export 了 `TAG`**，替 runner 把答案填上了。真实 runner 上它会在下一次发版时红，
+而且红在 `Create Release` **之后**：Release 已经发出去，`mirror` job 因为
+`needs: release` 不再运行，走 GitHub 的机器升了、走国内镜像的机器没升，
+两边版本就此分叉。
+
+别的检查都抓不到：`shellcheck` 的 SC2154 故意跳过全大写变量名（它假定那是
+外部传入的）；`bash -n` 只看语法；YAML 本身也完全合法。
+
+**对策**：
+
+- 每个 step 自己声明它用到的 env，不要指望「上面设过了」
+- 模拟 step 时用 `env -i`，**只放 YAML 里声明的变量**。手工 export 等于替 runner 作答
+- `scripts/lint-workflow-env.py` 读 YAML 的作用域专查这一类，挂在 `selftest.yml` 里，
+  改任何 workflow 都会跑（它有 `--selftest`，先证明自己会红）
+- 断言要防「空输入让它恒真」：`[ -n "${TAG:-}" ]` 放在 `case` 前面
+
+> 和第 8 条是一对：约束写进代码才拦得住 —— 但**写进代码的断言，
+> 在真实环境里跑通一次之前，也只是一个假设。**
+
+---
+
 ## 相关文档
 
 - [design.md](design.md) —— 设计取舍（为什么这么做）
