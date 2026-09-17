@@ -373,6 +373,10 @@ jobs:
       - name: Verify manifest install_sh is reachable
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # step 级 env 只对本 step 生效，「Generate Manifest」里的 TAG 到这里是看不见的。
+          # 漏了这一行：set -u 下直接 unbound variable，而且红在 Create Release 之后 ——
+          # Release 已经发出去，mirror 却不再跑。scripts/lint-workflow-env.py 专查这一类。
+          TAG: ${{ needs.init.outputs.version_tag }}
         run: |
           set -euo pipefail
           url="$(awk -F'\t' '$1=="install_sh"{print $2; exit}' manifest.txt)"
@@ -384,6 +388,12 @@ jobs:
           # 这条约束以前只写在交付说明里 —— 而交付说明是临时文件，看完就没了。
           # 结果是：漏掉这条改动时，清单照样生成、CI 照样全绿、什么都不报，
           # 只是地址悄悄退回分支。约束要写进代码才拦得住，写进文档只是希望。
+          #
+          # TAG 为空时，下面的模式会退化成 *"//"* —— 任何 https 地址都匹配，断言恒真。
+          # 所以先确认它非空；这条也把「没传到」和「没钉 tag」分成两句不同的报错。
+          [ -n "${TAG:-}" ] || {
+            echo "::error::TAG 为空，钉 tag 断言无从判断 —— 本 step 的 env 没拿到 needs.init.outputs.version_tag"
+            exit 1; }
           case "$url" in
             *"/${TAG}/"*) ;;
             *) echo "::error::清单里的 install_sh 没有钉 tag: ${url}。指向分支意味着这份不可变的清单里塞了一个活动引用 —— 往分支推一个坏的 install.sh，所有按清单消费的机器下一次全都坏，而且没有回滚路径。"

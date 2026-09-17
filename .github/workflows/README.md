@@ -23,7 +23,7 @@
 | `build.yml` | Build Custom Caddy | `go.mod` / `go.sum` 变更、手动 | 编译 amd64 + arm64、冒烟测试、生成 release notes、发 Release、清理旧 Release、（可选）推 R2 | GitHub Release + R2 |
 | `sync_dist.yml` | Sync dist assets | 每周一 18:00、手动 | 从 `caddyserver/dist` 拉默认 Caddyfile 和欢迎页 | 提交回本仓库 `dist/` |
 | `mirror.yml` | Mirror | 由 `build.yml` 自动调用，也可手动 | 把 Release 的 4 个资产 + `install.sh` + `manifest.txt` 分发到 Gitee / CNB / R2 | 各平台仓库、Release、存储桶 |
-| `selftest.yml` | Contract Selftest | 改 `install.sh` / 自测脚本 / `CONTRACT.md` 时，以及 PR | 跑 `contract-selftest.sh`（20 条断言），再跑 `contract-mutation-check.sh` 确认自测本身有效 | 只有红绿 |
+| `selftest.yml` | Contract Selftest | 改 `install.sh` / 自测脚本 / `CONTRACT.md` / **任何 workflow** 时，以及 PR | ① 跑 `contract-selftest.sh`（20 条断言），再跑 `contract-mutation-check.sh` 确认自测本身有效；② 跑 `lint-workflow-env.py`，查「引用了别的 step 的 env」 | 只有红绿 |
 | `dependabot.yml` | — | 每月 | 只跟 Actions 版本，**不管 Go 依赖**（那是 `update_deps` 的活） | PR |
 
 ---
@@ -51,7 +51,7 @@
 | :--- | :--- | :--- |
 | `init` | 生成全局版本号 `v2.11.4-20260807.1930` | 只生成一次，两个架构共用，避免跨分钟产生不同 tag |
 | `build` | matrix × {amd64, arm64}：`go mod verify` → `go build` → 冒烟测试 → release notes | 不跑 `go mod tidy`，`-mod=readonly` 保证可复现 |
-| `release` | 合并产物、拼 release 正文、发 Release、清理超出 `KEEP_RELEASES`（默认 12）的旧版本 | 清理按创建时间倒序跳过前 N 个，刚发的必然排第一；清理失败不标红 |
+| `release` | 合并产物、拼 release 正文、发 Release、校验清单里的 `install_sh`（钉 tag / 可达 / 与本次逐字节一致）、清理超出 `KEEP_RELEASES`（默认 12）的旧版本 | 校验在发 Release **之后**：它红了，Release 已经在 GitHub 上，但 `mirror` 不会跑。清理按创建时间倒序跳过前 N 个，刚发的必然排第一；清理失败不标红 |
 | `mirror` | 调用 `mirror.yml` 分发到所有下游平台 | 每个平台的 token/变量没配就各自跳过 |
 
 冒烟测试只在 amd64 跑（runner 执行不了 arm64 二进制）：核对 `caddy version` 与
@@ -171,6 +171,18 @@ grep -q "$pat" <<< "$var"      # 断言用 here-string：不产生独立的写�
 > 然后它保护的东西就再也没人管了。
 >
 > 完整的坑清单见 [docs/TRAPS.md](../../docs/TRAPS.md)。
+
+### step 级 env 不跨 step
+
+写在某个 step `env:` 下的变量，只对那一个 step 生效。后面的 step 引用同名变量
+拿到的是「未设置」：开了 `set -u` 就当场红，没开就展开成空串 ——
+后者更糟，`case "$url" in *"/${TAG}/"*)` 会退化成 `*"//"*`，对任何 https 地址恒真。
+
+**每个 step 自己声明它用到的 env。** `selftest.yml` 里的
+[`lint-workflow-env.py`](../../scripts/lint-workflow-env.py) 专查这一类；
+shellcheck 查不到（SC2154 跳过全大写变量名）。本地模拟 step 时用 `env -i`，
+只放 YAML 里声明的变量 —— 这个仓库吃过「先 export 好再测，结果全对」的亏，
+见 [TRAPS.md 第 9 条](../../docs/TRAPS.md#9-step-级-env-不跨-step--而本地模拟正好把它盖住)。
 
 ### 软 404
 

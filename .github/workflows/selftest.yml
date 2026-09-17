@@ -7,7 +7,12 @@ name: Contract Selftest
 #
 # 不需要网络（清单走 file://）、不需要 root、不碰真实系统目录，
 # 所以几秒就完事，可以放心挂在每个 PR 上。
+#
+# 第二个 job 查 workflow 自己：step 级 env 不跨 step（docs/TRAPS.md 第 9 条）。
+# 同样不能指望 build.yml 替它发现 —— 等 build 跑到那一步时 Release 已经发出去了。
 
+# 两份 paths 必须一致。不用 YAML 锚点合并：依赖它的工具链（Dependabot、各类 lint）
+# 支持程度不一，一个解析失败就是整个 workflow 不跑 —— 而「不跑」是不会报红的。
 on:
   push:
     paths:
@@ -15,12 +20,22 @@ on:
       - 'scripts/contract-selftest.sh'
       - 'scripts/contract-mutation-check.sh'
       - 'CONTRACT.md'
+      # workflow env 检查要读的：workflow 本身、检查脚本、被 source 的库
+      - '.github/workflows/**'
+      - 'scripts/lint-workflow-env.py'
+      - 'scripts/ci-lib.sh'
+      - 'scripts/mirror-lib.sh'
   pull_request:
     paths:
       - 'scripts/install.sh'
       - 'scripts/contract-selftest.sh'
       - 'scripts/contract-mutation-check.sh'
       - 'CONTRACT.md'
+      # workflow env 检查要读的：workflow 本身、检查脚本、被 source 的库
+      - '.github/workflows/**'
+      - 'scripts/lint-workflow-env.py'
+      - 'scripts/ci-lib.sh'
+      - 'scripts/mirror-lib.sh'
   workflow_dispatch:
 
 permissions:
@@ -41,3 +56,22 @@ jobs:
       # 块标量会撑破缩进；放脚本里还能和它保护的断言待在同一个目录。
       - name: Verify the selftest can fail
         run: bash scripts/contract-mutation-check.sh
+
+  workflow-env:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # runner 镜像的系统 python 通常自带 PyYAML；没有就装系统包，
+      # 不用 pip（Ubuntu 24.04 的系统 python 拒绝 pip 直装），也不为此多引一个 action。
+      - name: Ensure PyYAML
+        run: |
+          python3 -c 'import yaml' 2>/dev/null && exit 0
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+
+      # 和上面的变异检测同一个道理：先确认检查自己会红，再拿它查真的 workflow。
+      - name: Verify the lint can fail
+        run: python3 scripts/lint-workflow-env.py --selftest
+
+      - name: Lint step-scoped env
+        run: python3 scripts/lint-workflow-env.py
