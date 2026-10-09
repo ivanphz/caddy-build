@@ -6,18 +6,18 @@ require (
 	github.com/LeenHawk/caddy-edgeone-ip v0.1.1
 	github.com/WeidiDeng/caddy-cloudflare-ip v0.0.0-20231130002422-f53b62aa13cb
 	github.com/caddy-dns/tencentcloud v0.4.3
-	github.com/caddyserver/caddy/v2 v2.11.6
+	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/caddyserver/forwardproxy v0.0.0-20260321230143-0aab84dad4fc
 	github.com/caddyserver/jsonc-adapter v0.0.0-20200325004025-825ee096306c
 	github.com/fvbommel/caddy-combine-ip-ranges v0.0.1
-	github.com/greenpau/caddy-security v1.3.0
+	github.com/greenpau/caddy-security v1.4.1
 	github.com/imgk/caddy-trojan v0.2.11-4
 	github.com/lanrat/caddy-dynamic-remoteip v0.0.0-20231007025615-f72ed4fc7b9c
 	github.com/mholt/caddy-events-exec v0.1.0
 	github.com/mholt/caddy-l4 v0.1.2
 	github.com/mholt/caddy-ratelimit v0.1.0
 	github.com/mholt/caddy-webdav v0.0.0-20260127042217-fa2f366b0d75
-	github.com/monobilisim/caddy-ip-list v0.0.0-20250818180736-cd5c45325ade
+	github.com/monobilisim/caddy-ip-list v0.0.0-20261004115945-fef199d3564e
 	github.com/okrc/caddy-uploadcert-tencentcloud v0.1.3
 	github.com/porech/caddy-maxmind-geolocation v1.0.3
 	github.com/tuzzmaniandevil/caddy-dynamic-clientip v1.0.5
@@ -41,11 +41,11 @@ require (
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/Masterminds/sprig/v3 v3.3.0 // indirect
-	github.com/ProtonMail/go-crypto v1.4.1 // indirect
+	github.com/ProtonMail/go-crypto v1.5.2 // indirect
 	github.com/alecthomas/chroma/v2 v2.27.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/aryann/difflib v0.0.0-20210328193216-ff5ff6dc229b // indirect
-	github.com/beevik/etree v1.8.0 // indirect
+	github.com/beevik/etree v1.8.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.25.0 // indirect
 	github.com/caddyserver/certmagic v0.25.6 // indirect
@@ -65,6 +65,7 @@ require (
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da // indirect
 	github.com/dlclark/regexp2/v2 v2.8.0 // indirect
 	github.com/dunglas/go-urlpattern v1.0.0 // indirect
+	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
 	github.com/emersion/go-smtp v0.25.0 // indirect
@@ -92,7 +93,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.22 // indirect
 	github.com/googleapis/gax-go/v2 v2.25.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
-	github.com/greenpau/go-authcrunch v1.3.8 // indirect
+	github.com/greenpau/go-authcrunch v1.3.11 // indirect
 	github.com/greenpau/versioned v1.0.36 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/huandu/xstrings v1.6.1 // indirect
@@ -219,4 +220,4 @@ require (
 	howett.net/plist v1.0.1 // indirect
 )
 
-replace github.com/caddyserver/forwardproxy => github.com/klzgrad/forwardproxy v0.0.0-20250118002110-d62c80d3dd2c
+replace github.com/caddyserver/forwardproxy => github.com/klzgrad/forwardproxy v0.0.0-20261006113151-c096d6a00cb2
