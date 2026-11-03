@@ -39,6 +39,11 @@
    - 普通行 → `go get @latest`
 3. 生成 `main.go`（唯一真源，没有 `tools.go`）
 4. `go mod tidy` + 试编译，**编译不过就不提交**
+   - 例外：编译报错点名的是一个**跟分支走**的 replace（如 `forwardproxy@naive`）时，
+     自动沿该分支往回找最新一个能编过的提交（最多 15 个，走到上次提交的版本为止），
+     其余插件照常升级。回退会出现在 job summary、`::warning::` 和 commit message 里；
+     等 Caddy 发了新版、分支头能编过，下一次运行自动回到最新，不用手改 `plugins.txt`
+   - 钉 tag / commit 的条目和普通插件不回退，编不过照常失败
 5. 有解析失败的条目 → workflow 直接失败并列出来
 
 必须用 `secrets.PAT` 提交：`GITHUB_TOKEN` 的推送不会触发下游 `build.yml`。
@@ -51,7 +56,7 @@
 | :--- | :--- | :--- |
 | `init` | 生成全局版本号 `v2.11.4-20260807.1930` | 只生成一次，两个架构共用，避免跨分钟产生不同 tag |
 | `build` | matrix × {amd64, arm64}：`go mod verify` → `go build` → 冒烟测试 → release notes | 不跑 `go mod tidy`，`-mod=readonly` 保证可复现 |
-| `release` | 合并产物、拼 release 正文、发 Release、校验清单里的 `install_sh`（钉 tag / 可达 / 与本次逐字节一致）、清理超出 `KEEP_RELEASES`（默认 12）的旧版本 | 校验在发 Release **之后**：它红了，Release 已经在 GitHub 上，但 `mirror` 不会跑。清理按创建时间倒序跳过前 N 个，刚发的必然排第一；清理失败不标红 |
+| `release` | 合并产物、拼 release 正文、发 Release、校验清单里的 `install_sh`（钉 tag / 可达 / 与本次逐字节一致）、清理超出 `KEEP_RELEASES`（默认 12）的旧版本 | 本 job 只 sparse checkout `scripts/install.sh` 用于逐字节比对。校验在发 Release **之后**：它红了，Release 已经在 GitHub 上，但 `mirror` 不会跑。清理按创建时间倒序跳过前 N 个，刚发的必然排第一；清理失败不标红 |
 | `mirror` | 调用 `mirror.yml` 分发到所有下游平台 | 每个平台的 token/变量没配就各自跳过 |
 
 冒烟测试只在 amd64 跑（runner 执行不了 arm64 二进制）：核对 `caddy version` 与

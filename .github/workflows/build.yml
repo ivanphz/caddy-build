@@ -271,6 +271,16 @@ jobs:
     needs: [init, build]
     runs-on: ubuntu-latest
     steps:
+      # 只拉 install.sh 一个文件：「Verify manifest install_sh is reachable」要拿它
+      # 和 raw 上取到的逐字节比对。以前这个 job 完全没有 checkout，cmp 比的是一个
+      # 不存在的文件 —— cmp -s 对「文件缺失」和「内容不同」一样返回非零，
+      # 于是每次发版都报「内容不一致」，Release 发出去了、mirror 却从不跑。
+      - name: Checkout install.sh
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/install.sh
+          sparse-checkout-cone-mode: false
+
       - name: Download Artifacts
         uses: actions/download-artifact@v8
         with:
@@ -419,7 +429,11 @@ jobs:
           [ "$first2" = '#!' ] \
             || { echo "::error::install_sh 取到的不是脚本（开头是 '${first2}'）: $url"; exit 1; }
 
-          # 顺带确认它就是本次发布的那一份，而不是 CDN 给的旧副本
+          # 顺带确认它就是本次发布的那一份，而不是 CDN 给的旧副本。
+          # 先单独确认本地这份在：cmp -s 对「文件缺失」也返回非零，
+          # 不拆开的话 checkout 漏了会被误报成「内容不一致」（2026-09 ~ 10 实际发生过）。
+          [ -f scripts/install.sh ] \
+            || { echo "::error::本地没有 scripts/install.sh，无从比对 —— 本 job 的 checkout 漏了或 sparse 路径不对"; exit 1; }
           if cmp -s "$probe" scripts/install.sh; then
             echo "✓ 可达，且与本次发布的 install.sh 逐字节相同"
           else
@@ -433,12 +447,12 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}   # 本 job 没有 checkout，gh 需要显式指定仓库
+          GH_REPO: ${{ github.repository }}   # 本 job 只 sparse checkout 了 install.sh，显式指定仓库更稳
           KEEP: ${{ vars.KEEP_RELEASES || 12 }}
         run: |
           set -euo pipefail
 
-          # 这个 job 没有 checkout，ci-lib.sh 取不到，重试就地写一份小的
+          # 本 job 只 checkout 了 install.sh，ci-lib.sh 取不到，重试就地写一份小的
           gh_retry() {
             local out="$1"; shift
             local i
