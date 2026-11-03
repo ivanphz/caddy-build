@@ -46,6 +46,13 @@ jobs:
             go mod init "github.com/${{ github.repository }}"
           fi
 
+          # ---- 0.5 记下旧 replace 指向的版本 ----
+          # 编译失败时的回退要用：上次提交的那个版本是「已知能编过」的下限。
+          declare -A prev_ver=()
+          while IFS=$'\t' read -r old ver; do
+            [ -n "$old" ] && prev_ver[$old]="$ver"
+          done < <(go mod edit -json | jq -r '.Replace[]? | "\(.Old.Path)\t\(.New.Version // "")"')
+
           # ---- 1. 离线清掉所有旧 replace ----
           # 用 go mod edit -json 而不是 go list -m all：纯本地解析，不走网络，不会被网络故障静默跳过
           for pkg in $(go mod edit -json | jq -r '.Replace[]?.Old.Path'); do
@@ -60,6 +67,8 @@ jobs:
           declare -A seen=()
           declare -a imports=()
           declare -a failed=()
+          # 跟分支走的 replace（形如 a=b@naive）：编译失败时可以沿分支往回找
+          declare -a tracked=()
 
           # tr -d '\r'：防 CRLF 混入导致 import 里带 ^M
           while read -r line; do
@@ -98,6 +107,11 @@ jobs:
               # ORIGINAL 已被 replace，不参与编译；去追它的上游只会让 go.mod 每周无谓变更，
               # 进而触发一次内容完全相同的 Release。require 行交给下面的 go mod tidy 补。
               TARGET="$ORIGINAL"
+
+              # 只有「分支」才值得回退：tag / commit 是用户自己钉死的，回退等于违背意图
+              if [[ ! "$REPL_REF" =~ ^v[0-9] && ! "$REPL_REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+                tracked+=("${ORIGINAL}|${REPL_PATH}|${REPL_REF}")
+              fi
             else
               # --- 普通插件 ---
               if ! go get "${line}@latest"; then
@@ -144,8 +158,93 @@ jobs:
           go mod tidy
 
           # ---- 5. 编译自检：宁可在这里失败，也不要提交一个编译不过的 go.mod ----
-          go build -o /tmp/caddy-check .
+          #
+          # 跟分支走的插件，分支头可能已经用上了 Caddy 还没发版的 API
+          #（2026-10：klzgrad/forwardproxy@naive 的 e747854 用了只在 Caddy master 上有的
+          # caddyhttp.IdleTimeoutsFromContext，v2.11.7 编不过，每周更新连红两次）。
+          # 这类失败不该要人手动去 plugins.txt 钉 commit 再记得改回来：
+          # 编不过时沿该分支往回找最新一个能编过的提交，其余插件照常升级；
+          # 等 Caddy 发了新版，下一次运行分支头自然能编过，自动回到最新。
+          #
+          # 回退只针对【报错里点了名】的那个分支插件，最多往回 MAX_WALKBACK 个提交，
+          # 走到上次提交的版本（已知能编过）就停 —— 连它都不行，说明问题不在这个插件。
+          MAX_WALKBACK=15
+          held_file="${RUNNER_TEMP:-/tmp}/held-back.txt"
+          : > "$held_file"
+
+          build_ok() { go build -o /tmp/caddy-check . 2>/tmp/build.err; }
+
+          walk_back() {
+            local orig="$1" rpath="$2" rref="$3"
+            local cur prev cur_sha prev_sha dir sha ver
+            cur="$(go mod edit -json | jq -r --arg p "$orig" '.Replace[]? | select(.Old.Path==$p) | .New.Version')"
+            prev="${prev_ver[$orig]:-}"
+            cur_sha="${cur##*-}"; prev_sha="${prev##*-}"
+
+            dir="$(mktemp -d)"
+            local branch_args=()
+            [ "$rref" != latest ] && branch_args=(--branch "$rref")
+            if ! git clone -q --bare --filter=blob:none --single-branch "${branch_args[@]}" \
+                   "https://${rpath}" "$dir" 2>/tmp/clone.err; then
+              echo "  ✗ 克隆 ${rpath} 失败，无法回退: $(tail -n1 /tmp/clone.err)"
+              return 1
+            fi
+
+            local tried=0
+            while read -r sha; do
+              [ "${sha:0:12}" = "$cur_sha" ] && continue      # 就是刚编不过的那个
+              tried=$((tried + 1))
+              if ! ver="$(go list -m -f '{{.Version}}' "${rpath}@${sha}" 2>/dev/null)"; then
+                continue
+              fi
+              echo "  试 ${ver}"
+              go mod edit -replace "${orig}=${rpath}@${ver}"
+              if go mod tidy 2>/tmp/tidy.err && build_ok; then
+                echo "  ✓ ${ver} 能编过"
+                printf '%s@%s: 分支头 %s 编不过，暂用 %s\n' "$rpath" "$rref" "$cur" "$ver" >> "$held_file"
+                echo "::warning::${rpath}@${rref} 的最新提交 ${cur} 与当前 Caddy 编译不兼容，已自动回退到 ${ver}。上游/Caddy 更新后下次运行会自动回到最新。"
+                return 0
+              fi
+              if [ -n "$prev_sha" ] && [ "${sha:0:12}" = "$prev_sha" ]; then
+                echo "  ✗ 连上次的 ${prev} 也编不过，问题不在 ${orig} 的新提交"
+                break
+              fi
+            done < <(git -C "$dir" log --format=%H -n "$((MAX_WALKBACK + 1))" HEAD)
+
+            echo "  ✗ 往回 ${tried} 个提交都编不过，放弃回退"
+            go mod edit -replace "${orig}=${rpath}@${cur}"
+            go mod tidy
+            return 1
+          }
+
+          if ! build_ok; then
+            cat /tmp/build.err
+            for t in "${tracked[@]}"; do
+              IFS='|' read -r orig rpath rref <<< "$t"
+              # 只处理报错里出现的：包头行「# <import path>」或模块缓存路径「<repl>@<ver>/」
+              grep -qE "^# ${orig}(/| |\$)" /tmp/build.err \
+                || grep -qF "${rpath}@" /tmp/build.err \
+                || continue
+              echo "::group::编译失败点名了 ${orig}，沿 ${rpath}@${rref} 往回找"
+              walk_back "$orig" "$rpath" "$rref" || true
+              echo "::endgroup::"
+              build_ok && break
+            done
+            if ! build_ok; then
+              cat /tmp/build.err
+              echo "::error::编译失败，且无法通过回退分支插件解决"
+              exit 1
+            fi
+          fi
           /tmp/caddy-check version
+
+          if [ -s "$held_file" ]; then
+            {
+              echo "### ⚠️ 以下分支插件因编译不兼容被暂时回退"
+              echo
+              sed 's/^/- /' "$held_file"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           # ---- 6. 汇报失败项 ----
           if [ ${#failed[@]} -gt 0 ]; then
@@ -172,7 +271,18 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add go.mod go.sum main.go
-          git commit -m "chore(deps): sync from plugins.txt"
+          held_file="${RUNNER_TEMP:-/tmp}/held-back.txt"
+          if [ -s "$held_file" ]; then
+            # 回退信息进 commit message：git log 里一眼能看到哪个插件没跟到最新
+            # git commit 不允许 -m 和 -F 混用，整条消息先拼成文件
+            msg="${RUNNER_TEMP:-/tmp}/commit-msg.txt"
+            { echo "chore(deps): sync from plugins.txt"; echo
+              echo "暂时回退（分支头与当前 Caddy 编译不兼容）："
+              sed 's/^/- /' "$held_file"; } > "$msg"
+            git commit -F "$msg"
+          else
+            git commit -m "chore(deps): sync from plugins.txt"
+          fi
           # cron 与手动 push 撞车时不至于直接失败
           git pull --rebase --autostash
           git push
