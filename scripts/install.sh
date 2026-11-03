@@ -563,11 +563,16 @@ check_conflicts() {
 }
 
 do_install() {
-  need_root
   command -v curl >/dev/null || die "需要 curl"
-  check_conflicts
+  # 先解析版本、校验清单（只读网络和 mktemp，不碰系统目录），再要 root。
+  # 两个好处：清单坏了 / 契约不认识时，普通用户也能先看到真正的原因，
+  # 而不是被一句「需要 root」挡住、sudo 之后才发现装不了；
+  # 契约自测（④ M/N/O）也因此不需要 root 就能跑 —— 以前 CI 的 runner 不是 root，
+  # need_root 抢先 die，这三条在 GitHub 上从来没真正测到过。
   [ -n "$TAG" ] || TAG="$(latest_tag)"
   verify_manifest
+  need_root
+  check_conflicts
 
   local cur up_to_date=0
   cur="$(installed_tag)"
