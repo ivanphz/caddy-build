@@ -1,6 +1,6 @@
 module github.com/ivanphz/caddy-build
 
-go 1.26.0
+go 1.26.9
 
 require (
 	github.com/LeenHawk/caddy-edgeone-ip v0.1.1
@@ -14,7 +14,7 @@ require (
 	github.com/imgk/caddy-trojan v0.2.11-4
 	github.com/lanrat/caddy-dynamic-remoteip v0.0.0-20231007025615-f72ed4fc7b9c
 	github.com/mholt/caddy-events-exec v0.1.0
-	github.com/mholt/caddy-l4 v0.1.2
+	github.com/mholt/caddy-l4 v0.1.3
 	github.com/mholt/caddy-ratelimit v0.1.0
 	github.com/mholt/caddy-webdav v0.0.0-20260127042217-fa2f366b0d75
 	github.com/monobilisim/caddy-ip-list v0.0.0-20261024221327-99b5136d338f
@@ -125,15 +125,15 @@ require (
 	github.com/nlnwa/whatwg-url v0.6.2 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
-	github.com/pires/go-proxyproto v0.15.0 // indirect
+	github.com/pires/go-proxyproto v0.16.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.24.1 // indirect
+	github.com/prometheus/client_golang v1.25.0 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
-	github.com/prometheus/common v0.71.0 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.63.0 // indirect
+	github.com/quic-go/quic-go v0.64.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/riobard/go-bloom v0.0.0-20200614022211-cdc8013cb5b3 // indirect
 	github.com/rs/xid v1.6.0 // indirect
@@ -158,8 +158,9 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
 	github.com/tailscale/tscert v0.0.0-20251216020129-aea342f6d747 // indirect
-	github.com/things-go/go-socks5 v0.1.1 // indirect
+	github.com/things-go/go-socks5 v0.1.4 // indirect
 	github.com/urfave/cli v1.22.17 // indirect
+	github.com/vnxme/hybrid v0.1.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yuin/goldmark v1.8.6 // indirect
 	github.com/yuin/goldmark-highlighting/v2 v2.0.0-20230729083705-37449abec8cc // indirect
@@ -199,15 +200,15 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20261030153154-30a33513ff6d // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
-	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/term v0.46.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/term v0.47.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb // indirect
