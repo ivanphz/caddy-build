@@ -10,7 +10,7 @@ require (
 	github.com/caddyserver/forwardproxy v0.0.0-20260321230143-0aab84dad4fc
 	github.com/caddyserver/jsonc-adapter v0.0.0-20200325004025-825ee096306c
 	github.com/fvbommel/caddy-combine-ip-ranges v0.0.1
-	github.com/greenpau/caddy-security v1.6.2
+	github.com/greenpau/caddy-security v1.7.0
 	github.com/imgk/caddy-trojan v0.2.11-4
 	github.com/lanrat/caddy-dynamic-remoteip v0.0.0-20231007025615-f72ed4fc7b9c
 	github.com/mholt/caddy-events-exec v0.1.0
@@ -58,7 +58,7 @@ require (
 	github.com/cloudflare/circl v1.6.5 // indirect
 	github.com/coreos/go-oidc/v3 v3.21.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
-	github.com/crewjam/saml v0.5.1 // indirect
+	github.com/crewjam/saml v0.6.3 // indirect
 	github.com/dgraph-io/badger v1.6.2 // indirect
 	github.com/dgraph-io/badger/v2 v2.2007.4 // indirect
 	github.com/dgraph-io/ristretto v0.2.0 // indirect
@@ -80,7 +80,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-sql-driver/mysql v1.10.1 // indirect
-	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
@@ -93,7 +92,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.22 // indirect
 	github.com/googleapis/gax-go/v2 v2.25.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
-	github.com/greenpau/go-authcrunch v1.5.0 // indirect
+	github.com/greenpau/go-authcrunch v1.6.0 // indirect
 	github.com/greenpau/versioned v1.0.36 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/huandu/xstrings v1.6.1 // indirect
@@ -104,12 +103,11 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/libdns/tencentcloud v1.4.3 // indirect
 	github.com/manifoldco/promptui v0.9.0 // indirect
-	github.com/mattermost/xml-roundtrip-validator v0.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d // indirect
